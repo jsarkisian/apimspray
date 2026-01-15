@@ -1,5 +1,6 @@
-<p align="center">
-  <b>apimspray</b>
+
+ <p align="center">
+ <img src="Logo.png" width="500px" alt="Apimspray" />
 </p>
 
 ## apimspray
