@@ -1,0 +1,4 @@
+*.txt
+results/
+__pycache__/
+GEMINI.md
