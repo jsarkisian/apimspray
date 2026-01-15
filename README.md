@@ -1,6 +1,6 @@
 
  <p align="center">
- <img src="Logo.png" width="500px" alt="Apimspray" />
+ <img src="Logo.png" width="1000px" alt="Apimspray" />
 </p>
 
 ## apimspray
