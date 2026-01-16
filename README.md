@@ -20,6 +20,8 @@
 ![Azure](https://img.shields.io/badge/Azure-APIM-blue?logo=microsoftazure)
 ![License](https://img.shields.io/badge/License-Research--Only-lightgrey)
 ![Status](https://img.shields.io/badge/Status-Active%20Development-green)
+
+
 apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for authorized security research and Red Teaming. It utilizes Azure API Management (APIM) gateways as a distributed, rotating proxy layer for IP Rotating.
 
 
@@ -58,7 +60,7 @@ apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for au
 
 Run apimspray directly from an authenticated Azure environment.
 
-[![Open in Azure Cloud Shell](https://aka.ms/cloudshell/launchbutton.svg)](https://shell.azure.com/bash)
+[![Open in Azure Cloud Shell](https://az-icons.com/api/icon/azure-cloud-shell/download?format=png)](https://shell.azure.com/bash)
 
 ```bash
 git clone https://github.com/crtvrffnrt/apimspray.git
