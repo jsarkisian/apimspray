@@ -60,6 +60,12 @@ apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for au
 
 Run apimspray directly from an authenticated Azure environment.
 
+<a href="https://shell.azure.com/bash">
+  <img src="https://az-icons.com/api/icon/azure-cloud-shell/download?format=png"
+       alt="Open in Azure Cloud Shell"
+       width="180" />
+</a>
+
 [![Open in Azure Cloud Shell](https://az-icons.com/api/icon/azure-cloud-shell/download?format=png)](https://shell.azure.com/bash)
 
 ```bash
