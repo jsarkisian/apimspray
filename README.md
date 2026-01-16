@@ -3,13 +3,26 @@
  <img src="Logo.png" width="1000px" alt="Apimspray" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/crtvrffnrt/apimspray">
+    <img src="https://img.shields.io/badge/GitHub-Repository-black?style=for-the-badge&logo=github">
+  </a>
+  <a href="https://shell.azure.com/bash">
+    <img src="https://img.shields.io/badge/Azure-Cloud%20Shell-0078D4?style=for-the-badge&logo=microsoftazure">
+  </a>
+  <a href="https://learn.microsoft.com/entra/identity/">
+    <img src="https://img.shields.io/badge/Microsoft-Entra%20ID-6264A7?style=for-the-badge&logo=microsoft">
+  </a>
+</p>
+
 ## apimspray
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
+![Azure](https://img.shields.io/badge/Azure-APIM-blue?logo=microsoftazure)
+![License](https://img.shields.io/badge/License-Research--Only-lightgrey)
+![Status](https://img.shields.io/badge/Status-Active%20Development-green)
+apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for authorized security research and Red Teaming. It utilizes Azure API Management (APIM) gateways as a distributed, rotating proxy layer for IP Rotating.
 
-apimspray is a specialized **Entra ID Authentication Assessment Toolkit** designed for authorized security research and Red Teaming. It utilizes Azure API Management (APIM) gateways as a distributed, rotating proxy layer to analyze authentication behavior and simulate distributed traffic patterns.
 
-> **⚠️ AUTHORIZED USE ONLY**  
-> This tool is intended for use by authorized security professionals to validate detection capabilities and authentication protections.  
-> Unimplemented or malicious use against targets without permission is illegal.
 
 ## Features
 
@@ -23,8 +36,7 @@ apimspray is a specialized **Entra ID Authentication Assessment Toolkit** design
 
 ## Prerequisites
 
-- **Python 3.10+**
-- **Azure CLI (`az`)**: Required for the rotator script to deploy resources.
+- **Azure CLI (`az`)**: Required for the rotator script to deploy resources. (Execute script from cli session already authenticated to az cli or use Azure Cloud Shell)
 - **Active Azure Subscription**: To deploy APIM Consumption tier resources (Cost is negligible, typically <$0.01 for short assessments).
 
 ### Installation
@@ -42,6 +54,17 @@ apimspray is a specialized **Entra ID Authentication Assessment Toolkit** design
 
 ## Setup
 
+### Quick Start (Azure Cloud Shell)
+
+Run apimspray directly from an authenticated Azure environment.
+
+[![Open in Azure Cloud Shell](https://aka.ms/cloudshell/launchbutton.svg)](https://shell.azure.com/bash)
+
+```bash
+git clone https://github.com/crtvrffnrt/apimspray.git
+cd apimspray
+python3 apimspray.py --help
+``` 
 ### 1. Deploy Gateways
 You can deploy gateways manually or let `apimspray.py` handle it automatically.
 
