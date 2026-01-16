@@ -64,14 +64,12 @@ python3 apimspray.py --help
 Deploy multiple APIM Gateways into various Locations
 
 ```bash
-# Deploys 5 APIM instances and saves to urls.txt
 python3 apimspraycreate.py --count 5 --outfile urls.txt
 ```
 
-Deploy multiple APIM Gateways into specific Locations
+Deploys 33 APIM instances into Germanywestcentral and westeurope and saves to urls.txt
 
 ```bash
-# Deploys 533 APIM instances into Germanywestcentral and westeurope and saves to urls.txt
  python3 apimspraycreate.py --location germanywestcentral,westeurope --count 33 --outfile urls.txt
 ```
 
@@ -115,7 +113,7 @@ If you do not have a user list, you can use the helper script `generate_upns.py`
 ```bash
 # Generate users.txt for a specific domain or tenant ID
 python3 generate_upns.py --target example.com
-# OR
+# OR using Tenantid
 python3 generate_upns.py --target 00000000-0000-0000-0000-000000000000
 ```
 
@@ -133,17 +131,6 @@ options:
 
 ## Usage
 
-apimspray is driven by `apimspray.py`. You provide a gateway list (`--urls`) plus user and password lists, then choose a mode and pacing profile.
-
-**Common executions:**
-```bash
-python3 apimspray.py --urls urls.txt --users users.txt --passwords pass.txt --pace medium --mode spray --domain cyber-brunch.de
-python3 apimspray.py --urls urls.txt --mode spray --users user.txt --passwords pass.txt --pace stealth
-python3 apimspray.py --urls urls.txt --mode validate --users paired_users.txt --passwords paired_passwords.txt --pace low
-python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords pass.txt --tenant 00000000-0000-0000-0000-000000000000 --output results/customer-a
-```
-
-**CLI reference:**
 ```text
 usage: apimspray.py [-h] [--urls URLS] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate} [--pace {stealth,low,mid,medium,high}]
                     [--continue-on-success]
@@ -173,12 +160,20 @@ options:
 
 ### Modes
 
-- **spray**: Tests each password against all users (1:N), pausing between chunks to respect lockout windows.
-- **validate**: Tests a list of paired `user:password` entries (1:1). The users and passwords files must align by line order.
+- **validate**: Checks a list of `user:password` pairs. Requires equal length lists.
+
+  ```bash
+  python3 apimspray.py --urls urls.txt --mode validate --users u.txt --passwords p.txt
+  ```
+
+- **spray**: Attempts one password against all users, then waits (if configured), then moves to the next password.
+  ```bash
+  python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords common_passwords.txt --pace medium
+  ```
 
 ### Pacing Profiles
 
-Choose a `--pace` preset to balance speed, lockout safety, and noise.
+The `--pace` argument controls the aggressiveness of the spray. Values are hardcoded to ensure stability and safety.
 
 | Profile   | Workers | Delay | Count (Chunk) | Lockout Wait | Safe Threshold | Jitter |
 | :-------- | :-----: | :---: | :-----------: | :----------: | :------------: | :----: |
