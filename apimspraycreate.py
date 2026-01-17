@@ -9,8 +9,6 @@ import subprocess
 import sys
 import time
 import os
-import shutil
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Colors
@@ -85,18 +83,27 @@ def parse_location_list(value):
         return []
     return [normalize_location(part) for part in value.split(",") if part.strip()]
 
-def deploy_instance(index, location, resource_group, timestamp, prefix, realm_prefix, backend_url, product_id, tmp_dir):
+def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id):
     apim_name = f"apimspray-created-apim-{timestamp}-Number-{index}"
     api_id = "oauth"
-    realm_api_id = "userrealm"
-    url_file = os.path.join(tmp_dir, f"{apim_name}.url")
     
     try:
         log("info", f"[{apim_name}] Creating APIM instance in {location}...")
-        run_command(f"az apim create --name {apim_name} --resource-group {resource_group} --location {location} --publisher-name Proxy --publisher-email proxy@example.com --sku-name Consumption --no-wait")
+        retry_command(
+            f"az apim create --name {apim_name} --resource-group {resource_group} "
+            f"--location {location} --publisher-name Proxy --publisher-email proxy@example.com "
+            "--sku-name Consumption --no-wait",
+            attempts=3,
+            delay=20,
+        )
 
         log("info", f"[{apim_name}] Waiting for deployment...")
-        run_command(f"az apim wait --name {apim_name} --resource-group {resource_group} --created --interval 10 --timeout 1800")
+        retry_command(
+            f"az apim wait --name {apim_name} --resource-group {resource_group} "
+            "--created --interval 10 --timeout 1800",
+            attempts=3,
+            delay=20,
+        )
 
         log("info", f"[{apim_name}] Creating OAuth API...")
         retry_command(f"az apim api create --service-name {apim_name} --resource-group {resource_group} --api-id {api_id} --path {prefix} --display-name OAuth --protocols https --api-type http --service-url {backend_url}")
@@ -116,29 +123,13 @@ def deploy_instance(index, location, resource_group, timestamp, prefix, realm_pr
         # Get Gateway URL
         service_url = retry_command(f"az apim show --name {apim_name} --resource-group {resource_group} --query gatewayUrl -o tsv")
         final_url = f"{service_url}/{prefix}"
-        
-        # User Realm logic could be added here similar to bash script if needed, but the main goal is apimspray urls
-        # Bash script adds userrealm. Let's add it for parity.
-        
-        log("info", f"[{apim_name}] Creating UserRealm API...")
-        retry_command(f"az apim api create --service-name {apim_name} --resource-group {resource_group} --api-id {realm_api_id} --path {realm_prefix} --display-name UserRealm --protocols https --api-type http --service-url {backend_url}")
 
-        log("info", f"[{apim_name}] Attaching UserRealm API...")
-        retry_command(f"az apim product api add --resource-group {resource_group} --service-name {apim_name} --product-id {product_id} --api-id {realm_api_id}")
-
-        log("info", f"[{apim_name}] Creating userrealm operation...")
-        retry_command(f"az apim api operation create --resource-group {resource_group} --service-name {apim_name} --api-id {realm_api_id} --operation-id userrealm --url-template /getuserrealm.srf --method GET --display-name userrealm")
-
-        # Write URL to file
-        with open(url_file, "w") as f:
-            f.write(f"{final_url}/\n")
-        
         log("ok", f"[{apim_name}] Ready at {final_url}/")
-        return (index, location, True)
+        return (index, location, True, f"{final_url}/")
 
     except Exception as e:
         log("error", f"[{apim_name}] Failed: {e}")
-        return (index, location, False)
+        return (index, location, False, None)
 
 def main():
     parser = argparse.ArgumentParser(description="apimspraycreate - Azure APIM Deployer")
@@ -152,7 +143,6 @@ def main():
         ),
     )
     parser.add_argument("--prefix", default="oauth", help="API URL prefix")
-    parser.add_argument("--realm-prefix", default="realm", help="Realm API prefix")
     parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups")
     
     args = parser.parse_args()
@@ -194,11 +184,9 @@ def main():
         if args.location:
             log("warn", f"Requested count {count} exceeds selected regions {len(target_regions)}. Locations will repeat.")
         else:
-            log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Limiting.")
-            count = len(target_regions)
-    
-    if count < 1 or count > 199:
-        die("Count must be between 1 and 199")
+            log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Locations will repeat.")
+    if count < 1:
+        die("Count must be at least 1")
 
     # Config
     timestamp = int(time.time())
@@ -225,36 +213,39 @@ def main():
     log("ok", "Resource Group Ready")
 
     # Deploy
-    tmp_dir = tempfile.mkdtemp()
-    futures = []
-    
-    with ThreadPoolExecutor(max_workers=count) as executor:
-        for i in range(1, count + 1):
-            region = target_regions[(i - 1) % len(target_regions)]
-            futures.append(executor.submit(
-                deploy_instance, i, region, resource_group, timestamp, args.prefix, args.realm_prefix, backend_url, product_id, tmp_dir
-            ))
-            
-    # Wait
+    max_workers = min(32, count)
+    max_total_attempts = max(count * 3, count + 10)
+    next_index = 1
     successful_regions = []
     failed_regions = []
-    
-    for f in as_completed(futures):
-        idx, reg, success = f.result()
-        if success:
-            successful_regions.append(reg)
-        else:
-            failed_regions.append(reg)
+    urls = []
 
-    # Collect URLs
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while len(urls) < count and next_index <= max_total_attempts:
+            remaining = count - len(urls)
+            batch_size = min(max_workers, remaining, max_total_attempts - next_index + 1)
+            futures = []
+            for _ in range(batch_size):
+                region = target_regions[(next_index - 1) % len(target_regions)]
+                futures.append(executor.submit(
+                    deploy_instance, next_index, region, resource_group, timestamp, args.prefix, backend_url, product_id
+                ))
+                next_index += 1
+
+            for f in as_completed(futures):
+                idx, reg, success, url = f.result()
+                if success:
+                    successful_regions.append(reg)
+                    urls.append(url)
+                else:
+                    failed_regions.append(reg)
+
+    if len(urls) < count:
+        log("error", f"Only created {len(urls)} of {count} instances after retries.")
+
     with open(args.outfile, 'w') as f_out:
-        for i in range(1, count + 1):
-            fname = os.path.join(tmp_dir, f"apimspray-created-apim-{timestamp}-Number-{i}.url")
-            if os.path.exists(fname):
-                with open(fname, 'r') as f_in:
-                    f_out.write(f_in.read())
-
-    shutil.rmtree(tmp_dir)
+        for url in urls:
+            f_out.write(f"{url}\n")
 
     print("-" * 40)
     print(f"Resource Group : {resource_group}")

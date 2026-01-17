@@ -122,14 +122,25 @@ class APIMManager:
     def __init__(self, urls):
         self.urls = urls
         self.lock = threading.Lock()
-        self.url_iterator = itertools.cycle(urls) if urls else None
+        self._pool = []
+        self._last_url = None
 
     def get_next_url(self):
-        """Returns the next APIM URL (Round-Robin)."""
+        """Returns the next APIM URL, cycling through a shuffled pool."""
         with self.lock:
-            if not self.url_iterator:
+            if not self.urls:
                 raise ValueError("No APIM URLs available.")
-            return next(self.url_iterator)
+            if len(self.urls) == 1:
+                return self.urls[0]
+            if not self._pool:
+                self._pool = list(self.urls)
+                random.shuffle(self._pool)
+                if self._last_url and self._pool[0] == self._last_url and len(self._pool) > 1:
+                    # Avoid immediate repeats when refilling the pool.
+                    self._pool[0], self._pool[1] = self._pool[1], self._pool[0]
+            next_url = self._pool.pop(0)
+            self._last_url = next_url
+            return next_url
 
 class Logger:
     def __init__(self, output_dir):
@@ -484,7 +495,8 @@ def process_attempt(
         logger.log_result("failed", file_msg)
 
     # Global Stop Check
-    if classification.startswith("VALID") and not continue_on_success:
+    is_valid_credential = classification.startswith("VALID") or classification == "BLOCKED (Account Disabled)"
+    if is_valid_credential and not continue_on_success:
         print_success("Valid credentials found. Stopping as --continue-on-success is not set.")
         stop_event.set()
 
@@ -697,12 +709,16 @@ def main():
 
                 current_targets = [Target(u, password) for u in users if u not in locked_users_set and u not in invalid_users_set]
                 run_assessment(current_targets)
+                if stop_event.is_set():
+                    break
             
             # Lockout wait between chunks
             if i < len(pass_chunks) - 1:
                 lockout_wait = pace_config["lockout"]
-                print_info(f"Waiting {lockout_wait} minutes for lockout reset...")
-                time.sleep(lockout_wait * 60)
+                if stop_event.is_set():
+                    break
+                print_info(f"Waiting {lockout_wait} minutes for lockout reset... (Hit Enter to skip)")
+                wait_with_countdown(lockout_wait * 60, allow_skip=True)
 
     _print_summary(logger, locked_users_set, invalid_users_set)
 
