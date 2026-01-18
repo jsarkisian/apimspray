@@ -606,7 +606,7 @@ def main():
     workers = pace_config["workers"]
     base_delay = pace_config["delay"]
     
-    print_info(f"Starting apimspray v{VERSION}")
+    print_info(f"Starting apimspray")
     print_info(f"Mode: {style(args.mode, TermColors.MAGENTA, TermColors.BOLD)}")
     if args.mode == "spray":
         print_info(f"Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
