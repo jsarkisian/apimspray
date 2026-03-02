@@ -541,6 +541,16 @@ def main():
         action="store_true",
         help="Continue the assessment even after finding valid credentials.",
     )
+    parser.add_argument(
+        "--randomize-users",
+        action="store_true",
+        help=(
+            "Randomize the order of users before each password spray round.\n"
+            "This shuffles the user list so that login attempts do not follow a\n"
+            "predictable alphabetical or file-order sequence, reducing the\n"
+            "likelihood of pattern-based detection by defensive controls."
+        ),
+    )
     
     args = parser.parse_args()
 
@@ -583,6 +593,9 @@ def main():
     if args.users:
         users = load_file_lines(args.users)
         users = normalize_users(users, args.domain)
+        if args.randomize_users:
+            random.shuffle(users)
+            print_info(f"User list randomized ({len(users)} users shuffled)")
     
     passwords = []
     if args.passwords:
@@ -623,6 +636,8 @@ def main():
         f"Workers: {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)}, "
         f"Delay: {style(f'{base_delay}s', TermColors.MAGENTA, TermColors.BOLD)}"
     )
+    if args.randomize_users:
+        print_info(f"User Randomization: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (order shuffled each round)")
     
     # Shared State
     locked_users_set = set()
@@ -681,6 +696,8 @@ def main():
                     pass
 
     if args.mode == "validate":
+        if args.randomize_users:
+            random.shuffle(targets)
         run_assessment(targets)
     elif args.mode == "spray":
         if not users or not passwords:
@@ -710,6 +727,8 @@ def main():
                         sys.exit(1)
 
                 current_targets = [Target(u, password) for u in users if u not in locked_users_set and u not in invalid_users_set]
+                if args.randomize_users:
+                    random.shuffle(current_targets)
                 run_assessment(current_targets)
                 if stop_event.is_set():
                     break
