@@ -891,37 +891,30 @@ def process_enum_attempt(
     if stop_event.is_set():
         return
     result = teams_enumerator.enumerate_user(email, fetch_presence=False)
-    timestamp = utc_now_str()
-    gateway_host = result.get("gateway", "unknown")
 
     if result["valid"]:
         with lock:
             valid_users_set.add(email)
             if result.get("mri"):
                 valid_mris[email] = result["mri"]
-        display_parts = [email]
-        if result["display_name"]:
-            display_parts.append(f"({result['display_name']})")
-        display_str = " ".join(display_parts)
-        console_msg = f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(display_str, TermColors.GREEN, TermColors.BOLD)} | APIM: {gateway_host}"
-        file_msg = f"{email} | VALID | ObjID: {result.get('object_id', 'N/A')} | DisplayName: {result.get('display_name', 'N/A')} | TenantID: {result.get('tenant_id', 'N/A')} | APIM: {gateway_host}"
-        logger.log_result("enumerated", file_msg, console_msg)
+
+        display_name = result.get("display_name", "")
+        display_str = f"{email} ({display_name})" if display_name else email
+        print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(display_str, TermColors.GREEN, TermColors.BOLD)}")
+
+        file_msg = f"{email} | VALID | ObjID: {result.get('object_id', 'N/A')} | DisplayName: {display_name or 'N/A'} | TenantID: {result.get('tenant_id', 'N/A')}"
+        logger.log_result("enumerated", file_msg)
         logger.log_enum_detail({
-            "timestamp": timestamp,
+            "timestamp": utc_now_str(),
             "email": email,
             "valid": True,
             "object_id": result.get("object_id"),
-            "display_name": result.get("display_name"),
+            "display_name": display_name,
             "upn": result.get("upn"),
             "tenant_id": result.get("tenant_id"),
             "mri": result.get("mri"),
-            "out_of_office": result.get("out_of_office"),
-            "presence": result.get("presence"),
-            "gateway": gateway_host,
+            "gateway": result.get("gateway"),
         })
-    else:
-        if result.get("error"):
-            logger.log_result("failed", f"{email} | ERROR | {result['error']} | APIM: {gateway_host}")
 
 
 # ============================================================================
