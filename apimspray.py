@@ -898,22 +898,16 @@ def process_enum_attempt(
             if result.get("mri"):
                 valid_mris[email] = result["mri"]
 
-        display_name = result.get("display_name", "")
-        display_str = f"{email} ({display_name})" if display_name else email
-        print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(display_str, TermColors.GREEN, TermColors.BOLD)}")
+        print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(email, TermColors.GREEN, TermColors.BOLD)}")
 
-        file_msg = f"{email} | VALID | ObjID: {result.get('object_id', 'N/A')} | DisplayName: {display_name or 'N/A'} | TenantID: {result.get('tenant_id', 'N/A')}"
-        logger.log_result("enumerated", file_msg)
+        logger.log_result("enumerated", email)
         logger.log_enum_detail({
             "timestamp": utc_now_str(),
             "email": email,
             "valid": True,
             "object_id": result.get("object_id"),
-            "display_name": display_name,
-            "upn": result.get("upn"),
             "tenant_id": result.get("tenant_id"),
             "mri": result.get("mri"),
-            "gateway": result.get("gateway"),
         })
 
 
