@@ -173,99 +173,149 @@ class Logger:
                 f.write(f"{utc_now_str()} | {file_message}\n")
 
 class ProgressTracker:
-    """Thread-safe progress tracker with a background reporting thread."""
+    """Thread-safe progress tracker that prints status when the user hits Enter."""
 
-    def __init__(self, total, interval=3.0, label="Spraying"):
-        self.total = total
-        self.interval = interval
-        self.label = label
+    def __init__(self):
+        self._total = 0
         self._completed = 0
+        self._label = "Spraying"
         self._lock = threading.Lock()
         self._start_time = None
         self._stop_event = threading.Event()
-        self._thread = None
+        self._listener_thread = None
+        self._active = False
+        # Track overall progress across all rounds
+        self._global_total = 0
+        self._global_completed = 0
+        self._global_start_time = None
 
-    def start(self):
-        """Begin the background progress-reporting thread."""
-        self._start_time = time.monotonic()
-        self._completed = 0
+    def begin_session(self, overall_total):
+        """Start listening for Enter key presses for the entire spray session."""
+        self._global_total = overall_total
+        self._global_completed = 0
+        self._global_start_time = time.monotonic()
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._reporter_loop, daemon=True)
-        self._thread.start()
+        self._active = True
+        if sys.stdin.isatty():
+            self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self._listener_thread.start()
 
-    def stop(self):
-        """Signal the reporter thread to stop and print a final line."""
+    def end_session(self):
+        """Stop listening and print a final summary line."""
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-        # Print final status then clear the line
-        self._print_progress(final=True)
+        self._active = False
+        if self._listener_thread:
+            self._listener_thread.join(timeout=1)
+            self._listener_thread = None
+
+    def begin_round(self, total, label="Spraying"):
+        """Reset per-round counters (e.g. for each password)."""
+        with self._lock:
+            self._total = total
+            self._completed = 0
+            self._label = label
+            self._start_time = time.monotonic()
+
+    def end_round(self):
+        """Merge round completions into global total."""
+        with self._lock:
+            self._global_completed += self._completed
 
     def increment(self, n=1):
         """Called by worker threads when an attempt completes."""
         with self._lock:
             self._completed += n
 
-    def reset(self, total, label=None):
-        """Reset the tracker for a new round (e.g. next password)."""
-        with self._lock:
-            self.total = total
-            self._completed = 0
-            self._start_time = time.monotonic()
-            if label:
-                self.label = label
-
-    def _reporter_loop(self):
-        """Background loop that prints progress every `interval` seconds."""
+    def _listen_loop(self):
+        """Background thread: waits for Enter key, prints progress on demand."""
         while not self._stop_event.is_set():
-            self._print_progress()
-            self._stop_event.wait(self.interval)
+            try:
+                if self._stop_event.is_set():
+                    break
+                # Use select-style wait so we can break out on stop
+                ready = _stdin_ready(timeout=0.5)
+                if ready:
+                    sys.stdin.readline()
+                    if self._active and not self._stop_event.is_set():
+                        self._print_progress()
+            except Exception:
+                break
 
-    def _print_progress(self, final=False):
+    def _print_progress(self):
         if not sys.stdout.isatty():
             return
 
         with self._lock:
-            completed = self._completed
-            total = self.total
-            elapsed = time.monotonic() - self._start_time if self._start_time else 0
+            r_completed = self._completed
+            r_total = self._total
+            r_elapsed = time.monotonic() - self._start_time if self._start_time else 0
+            g_completed = self._global_completed + r_completed
+            g_total = self._global_total
+            g_elapsed = time.monotonic() - self._global_start_time if self._global_start_time else 0
+            label = self._label
 
-        if total == 0:
+        if r_total == 0:
             return
 
-        pct = (completed / total) * 100.0
-        rate = completed / elapsed if elapsed > 0 else 0.0
-
-        # ETA
-        if rate > 0 and completed < total:
-            remaining_secs = (total - completed) / rate
-            eta_str = _format_duration(remaining_secs)
-        elif completed >= total:
-            eta_str = "done"
+        # Per-round stats
+        r_pct = (r_completed / r_total) * 100.0
+        r_rate = r_completed / r_elapsed if r_elapsed > 0 else 0.0
+        if r_rate > 0 and r_completed < r_total:
+            r_eta = _format_duration((r_total - r_completed) / r_rate)
+        elif r_completed >= r_total:
+            r_eta = "done"
         else:
-            eta_str = "calculating..."
+            r_eta = "..."
 
-        elapsed_str = _format_duration(elapsed)
+        # Global stats
+        g_pct = (g_completed / g_total) * 100.0 if g_total > 0 else 0.0
+        g_rate = g_completed / g_elapsed if g_elapsed > 0 else 0.0
+        if g_rate > 0 and g_completed < g_total:
+            g_eta = _format_duration((g_total - g_completed) / g_rate)
+        elif g_completed >= g_total:
+            g_eta = "done"
+        else:
+            g_eta = "..."
 
+        # Build the bar for the current round
         bar_width = 20
-        filled = int(bar_width * completed / total)
+        filled = int(bar_width * r_completed / r_total) if r_total > 0 else 0
         bar = "█" * filled + "░" * (bar_width - filled)
 
-        line = (
-            f"    {style(self.label, TermColors.CYAN)} "
+        separator = style("─" * 60, TermColors.DIM)
+        round_line = (
+            f"  {style(label, TermColors.CYAN, TermColors.BOLD)} "
             f"[{bar}] "
-            f"{style(f'{pct:5.1f}%', TermColors.BOLD)} "
-            f"({completed}/{total}) "
-            f"| Elapsed: {elapsed_str} "
-            f"| ETA: {eta_str} "
-            f"| {rate:.1f} req/s"
+            f"{style(f'{r_pct:5.1f}%', TermColors.BOLD)} "
+            f"({r_completed}/{r_total}) "
+            f"| {r_rate:.1f} req/s "
+            f"| ETA: {r_eta}"
         )
+        global_line = (
+            f"  {style('Overall', TermColors.MAGENTA, TermColors.BOLD)}  "
+            f"{style(f'{g_pct:5.1f}%', TermColors.BOLD)} "
+            f"({g_completed}/{g_total}) "
+            f"| Elapsed: {_format_duration(g_elapsed)} "
+            f"| ETA: {g_eta} "
+            f"| {g_rate:.1f} req/s"
+        )
+        hint = style("  (press Enter again for updated progress)", TermColors.DIM)
 
-        # Overwrite the current line
-        print(f"\033[2K\r{line}", end="", flush=True)
+        print(f"\n{separator}")
+        print(round_line)
+        print(global_line)
+        print(f"{separator}{hint}\n", flush=True)
 
-        if final and completed > 0:
-            print()  # Newline after the final progress line
+def _stdin_ready(timeout=0.5):
+    """Check if stdin has data ready to read (cross-platform-ish)."""
+    import select
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        return bool(ready)
+    except (ValueError, OSError):
+        # stdin closed or not selectable (Windows)
+        time.sleep(timeout)
+        return False
 
 def _format_duration(seconds):
     """Format seconds into a human-readable string."""
@@ -663,9 +713,9 @@ def main():
         "--verbose",
         action="store_true",
         help=(
-            "Enable verbose progress output. Displays a live progress line every\n"
-            "few seconds showing percentage complete, attempts finished, elapsed\n"
-            "time, estimated time remaining, and current throughput rate."
+            "Enable on-demand progress output. Press Enter at any time during a\n"
+            "spray to see current round progress (bar, percentage, ETA) and overall\n"
+            "job progress (total attempts, elapsed time, throughput)."
         ),
     )
     
@@ -756,7 +806,7 @@ def main():
     if args.randomize_users:
         print_info(f"User Randomization: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (order shuffled each round)")
     if args.verbose:
-        print_info(f"Verbose Progress: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (live progress every 3s)")
+        print_info(f"Verbose Progress: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (press Enter anytime to see progress)")
     
     # Shared State
     locked_users_set = set()
@@ -767,18 +817,17 @@ def main():
     lock = threading.Lock()
     stop_event = threading.Event()
 
-    # Verbose progress tracker (created once, reset per round)
-    progress_tracker = ProgressTracker(total=0) if args.verbose else None
+    # Verbose progress tracker (created once, listens for Enter across entire session)
+    progress_tracker = ProgressTracker() if args.verbose else None
 
     def run_assessment(target_list, progress_label=None):
         nonlocal global_lockout_count
         if stop_event.is_set():
             return
 
-        # Start verbose progress for this round
+        # Begin a new progress round
         if progress_tracker:
-            progress_tracker.reset(len(target_list), label=progress_label or "Spraying")
-            progress_tracker.start()
+            progress_tracker.begin_round(len(target_list), label=progress_label or "Spraying")
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = []
@@ -821,19 +870,27 @@ def main():
                     if progress_tracker:
                         progress_tracker.increment()
 
-        # Stop verbose progress for this round
+        # End the round (merges into global counter)
         if progress_tracker:
-            progress_tracker.stop()
+            progress_tracker.end_round()
 
     if args.mode == "validate":
         if args.randomize_users:
             random.shuffle(targets)
+        if progress_tracker:
+            progress_tracker.begin_session(len(targets))
         run_assessment(targets, progress_label="Validating")
+        if progress_tracker:
+            progress_tracker.end_session()
     elif args.mode == "spray":
         if not users or not passwords:
             print_error("Spray mode requires --users and --passwords")
             sys.exit(1)
         
+        # Compute overall total for progress: users * passwords (approximate upper bound)
+        if progress_tracker:
+            progress_tracker.begin_session(len(users) * len(passwords))
+
         # Spray Mode with Chunks
         pass_chunk_size = pace_config["count"]
         pass_chunks = [passwords[i:i + pass_chunk_size] for i in range(0, len(passwords), pass_chunk_size)]
@@ -853,6 +910,8 @@ def main():
                 with lock:
                     if len(locked_users_set) >= pace_config["safe"]:
                         print_error(f"Safe threshold reached ({pace_config['safe']} lockouts). Terminating.")
+                        if progress_tracker:
+                            progress_tracker.end_session()
                         _print_summary(logger, locked_users_set, invalid_users_set)
                         sys.exit(1)
 
@@ -870,6 +929,9 @@ def main():
                     break
                 print_info(f"Waiting {lockout_wait} minutes for lockout reset... (Hit Enter to skip)")
                 wait_with_countdown(lockout_wait * 60, allow_skip=True)
+
+        if progress_tracker:
+            progress_tracker.end_session()
 
     _print_summary(logger, locked_users_set, invalid_users_set)
 
