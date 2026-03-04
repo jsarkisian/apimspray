@@ -172,6 +172,114 @@ class Logger:
             with open(self.files[result_type], "a", encoding="utf-8") as f:
                 f.write(f"{utc_now_str()} | {file_message}\n")
 
+class ProgressTracker:
+    """Thread-safe progress tracker with a background reporting thread."""
+
+    def __init__(self, total, interval=3.0, label="Spraying"):
+        self.total = total
+        self.interval = interval
+        self.label = label
+        self._completed = 0
+        self._lock = threading.Lock()
+        self._start_time = None
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        """Begin the background progress-reporting thread."""
+        self._start_time = time.monotonic()
+        self._completed = 0
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._reporter_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Signal the reporter thread to stop and print a final line."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        # Print final status then clear the line
+        self._print_progress(final=True)
+
+    def increment(self, n=1):
+        """Called by worker threads when an attempt completes."""
+        with self._lock:
+            self._completed += n
+
+    def reset(self, total, label=None):
+        """Reset the tracker for a new round (e.g. next password)."""
+        with self._lock:
+            self.total = total
+            self._completed = 0
+            self._start_time = time.monotonic()
+            if label:
+                self.label = label
+
+    def _reporter_loop(self):
+        """Background loop that prints progress every `interval` seconds."""
+        while not self._stop_event.is_set():
+            self._print_progress()
+            self._stop_event.wait(self.interval)
+
+    def _print_progress(self, final=False):
+        if not sys.stdout.isatty():
+            return
+
+        with self._lock:
+            completed = self._completed
+            total = self.total
+            elapsed = time.monotonic() - self._start_time if self._start_time else 0
+
+        if total == 0:
+            return
+
+        pct = (completed / total) * 100.0
+        rate = completed / elapsed if elapsed > 0 else 0.0
+
+        # ETA
+        if rate > 0 and completed < total:
+            remaining_secs = (total - completed) / rate
+            eta_str = _format_duration(remaining_secs)
+        elif completed >= total:
+            eta_str = "done"
+        else:
+            eta_str = "calculating..."
+
+        elapsed_str = _format_duration(elapsed)
+
+        bar_width = 20
+        filled = int(bar_width * completed / total)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        line = (
+            f"    {style(self.label, TermColors.CYAN)} "
+            f"[{bar}] "
+            f"{style(f'{pct:5.1f}%', TermColors.BOLD)} "
+            f"({completed}/{total}) "
+            f"| Elapsed: {elapsed_str} "
+            f"| ETA: {eta_str} "
+            f"| {rate:.1f} req/s"
+        )
+
+        # Overwrite the current line
+        print(f"\033[2K\r{line}", end="", flush=True)
+
+        if final and completed > 0:
+            print()  # Newline after the final progress line
+
+def _format_duration(seconds):
+    """Format seconds into a human-readable string."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m{s:02d}s"
+    else:
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        return f"{h}h{m:02d}m{s:02d}s"
+
 # --- Helper Functions ---
 
 def style(text, *styles):
@@ -551,6 +659,15 @@ def main():
             "likelihood of pattern-based detection by defensive controls."
         ),
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Enable verbose progress output. Displays a live progress line every\n"
+            "few seconds showing percentage complete, attempts finished, elapsed\n"
+            "time, estimated time remaining, and current throughput rate."
+        ),
+    )
     
     args = parser.parse_args()
 
@@ -638,6 +755,8 @@ def main():
     )
     if args.randomize_users:
         print_info(f"User Randomization: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (order shuffled each round)")
+    if args.verbose:
+        print_info(f"Verbose Progress: {style('ENABLED', TermColors.GREEN, TermColors.BOLD)} (live progress every 3s)")
     
     # Shared State
     locked_users_set = set()
@@ -648,10 +767,18 @@ def main():
     lock = threading.Lock()
     stop_event = threading.Event()
 
-    def run_assessment(target_list):
+    # Verbose progress tracker (created once, reset per round)
+    progress_tracker = ProgressTracker(total=0) if args.verbose else None
+
+    def run_assessment(target_list, progress_label=None):
         nonlocal global_lockout_count
         if stop_event.is_set():
             return
+
+        # Start verbose progress for this round
+        if progress_tracker:
+            progress_tracker.reset(len(target_list), label=progress_label or "Spraying")
+            progress_tracker.start()
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = []
@@ -688,17 +815,20 @@ def main():
             for f in as_completed(futures):
                 try:
                     res = f.result()
-                    if stop_event.is_set():
-                        # We don't want to kill everything immediately if we want summary, 
-                        # but we can stop submitting.
-                        pass
                 except Exception:
                     pass
+                finally:
+                    if progress_tracker:
+                        progress_tracker.increment()
+
+        # Stop verbose progress for this round
+        if progress_tracker:
+            progress_tracker.stop()
 
     if args.mode == "validate":
         if args.randomize_users:
             random.shuffle(targets)
-        run_assessment(targets)
+        run_assessment(targets, progress_label="Validating")
     elif args.mode == "spray":
         if not users or not passwords:
             print_error("Spray mode requires --users and --passwords")
@@ -729,7 +859,7 @@ def main():
                 current_targets = [Target(u, password) for u in users if u not in locked_users_set and u not in invalid_users_set]
                 if args.randomize_users:
                     random.shuffle(current_targets)
-                run_assessment(current_targets)
+                run_assessment(current_targets, progress_label=f"Password: {password}")
                 if stop_event.is_set():
                     break
             
