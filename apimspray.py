@@ -49,12 +49,14 @@ PACE_SETTINGS = {
 }
 
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
-# TeamFiltration uses maxDegreeOfParallelism: 300 with no delays
+# Teams API throttles at ~50-60 req/s per token regardless of source IP.
+# Workers set high for concurrency but a small delay between submissions
+# prevents 429s while keeping the pipeline full.
 ENUM_PACE_SETTINGS = {
-    "high": {"workers": 300, "delay": 0, "jitter": 0},
-    "medium": {"workers": 150, "delay": 0, "jitter": 0},
-    "mid": {"workers": 150, "delay": 0, "jitter": 0},
-    "low": {"workers": 50, "delay": 0, "jitter": 0},
+    "high": {"workers": 300, "delay": 0.003, "jitter": 0},    # ~300 req/s burst, settles to ~60 sustained
+    "medium": {"workers": 150, "delay": 0.007, "jitter": 0},   # ~140 req/s burst, settles to ~60 sustained
+    "mid": {"workers": 150, "delay": 0.007, "jitter": 0},
+    "low": {"workers": 50, "delay": 0.02, "jitter": 0},        # ~50 req/s, gentle
     "stealth": {"workers": 10, "delay": 1, "jitter": 20},
 }
 
@@ -1001,6 +1003,13 @@ def process_enum_attempt(
             failed_users_list.append(email)
         with counters_lock:
             counters["errors"] += 1
+            if "429" in str(result["error"]):
+                counters["rate_limited"] += 1
+                rl_count = counters["rate_limited"]
+                # Warn periodically — first hit, then every 100
+                if rl_count == 1 or rl_count % 100 == 0:
+                    print_warn(f"Rate limited (429) — {rl_count} total so far. These will be retried in the next pass.")
+                    sys.stdout.flush()
         return
 
     # Definitive response — count it
@@ -1342,7 +1351,7 @@ def _run_enumerate(args):
     lock = threading.Lock()
     stop_event = threading.Event()
 
-    counters = {"submitted": 0, "completed": 0, "checked": 0, "errors": 0}
+    counters = {"submitted": 0, "completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
     counters_lock = threading.Lock()
 
     # Multi-pass enumeration: fast first pass, then retry failures with lower concurrency
@@ -1389,7 +1398,7 @@ def _run_enumerate(args):
             for email in current_user_list:
                 if stop_event.is_set():
                     break
-                if base_delay > 0 and pass_workers == 1:
+                if base_delay > 0:
                     current_delay = base_delay
                     if enum_pace["jitter"] > 0:
                         jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
@@ -1414,9 +1423,10 @@ def _run_enumerate(args):
         # Set up retry with failed users
         current_user_list = list(failed_users_list)
         print_warn(f"{len(current_user_list)} users failed — retrying...")
-        # Reset error counter for the retry pass
+        # Reset error counters for the retry pass
         with counters_lock:
             counters["errors"] = 0
+            counters["rate_limited"] = 0
 
     # Phase 2: Presence/OOO pass (only for valid users, runs after enum completes)
     if not args.no_presence and valid_mris:
@@ -1485,6 +1495,7 @@ def _print_enum_summary(logger, valid_users, all_users, counters):
     completed = counters["completed"]
     checked = counters["checked"]
     errors = counters["errors"]
+    rate_limited = counters["rate_limited"]
     valid = len(valid_users)
     not_valid = checked - valid
     missed = submitted - completed
@@ -1496,6 +1507,8 @@ def _print_enum_summary(logger, valid_users, all_users, counters):
     print(f"Valid Users Found:   {style(str(valid), TermColors.GREEN, TermColors.BOLD)}")
     print(f"Not Valid:           {style(str(not_valid), TermColors.DIM)}")
     print(f"Errors/Timeouts:     {style(str(errors), TermColors.YELLOW, TermColors.BOLD)}")
+    if rate_limited > 0:
+        print(f"Rate Limited (429):  {style(str(rate_limited), TermColors.YELLOW, TermColors.BOLD)}")
     if missed > 0:
         print(f"Missed (not run):    {style(str(missed), TermColors.RED, TermColors.BOLD)}")
     coverage = (checked / len(all_users) * 100) if len(all_users) > 0 else 0
