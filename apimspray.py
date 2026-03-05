@@ -503,6 +503,11 @@ class TeamsEnumerator:
         self.bearer_token = None
         self.skype_token = None
         self._lock = threading.Lock()
+        self._reauth_in_progress = False
+        # Stored for mid-run re-authentication on token expiry
+        self._sac_user = None
+        self._sac_pass = None
+        self._tenant = "common"
 
     def _get_base_headers(self):
         """Construct base headers mimicking the Teams Android client."""
@@ -529,6 +534,11 @@ class TeamsEnumerator:
         Authenticate the sacrificial account through APIM to get a Teams bearer token.
         Uses the Teams client_id targeting the Skype API resource.
         """
+        # Store for mid-run re-authentication
+        self._sac_user = username
+        self._sac_pass = password
+        self._tenant = tenant
+
         gateway_url = self.login_apim_manager.get_next_url()
         if not gateway_url.endswith("/"):
             gateway_url += "/"
@@ -616,13 +626,16 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
-    def enumerate_user(self, email, fetch_presence=False):
+    def enumerate_user(self, email, fetch_presence=False, max_retries=2):
         """
         Check if a user exists via the Teams externalsearchv3 endpoint.
         Routes through APIM gateways when available, falls back to direct.
 
         When fetch_presence=False (default), skips the inline presence call
         to keep enumeration fast. Presence can be fetched in a separate pass.
+
+        Retries on transient failures (HTTP 500, timeouts) up to max_retries.
+        Detects token expiry (HTTP 401) and signals for re-authentication.
 
         Returns a dict with enumeration results.
         """
@@ -638,6 +651,7 @@ class TeamsEnumerator:
             "presence": None,
             "gateway": None,
             "error": None,
+            "token_expired": False,
         }
 
         headers = self._get_auth_headers()
@@ -647,78 +661,98 @@ class TeamsEnumerator:
             gateway_url = self.teams_apim_manager.get_next_url()
             if not gateway_url.endswith("/"):
                 gateway_url += "/"
-            # The Teams APIM proxies to https://teams.microsoft.com/api/mt/
-            # so we append the region + endpoint path
             enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
             result["gateway"] = urlparse(gateway_url).netloc
         else:
-            # Direct fallback (no APIM for Teams API)
             enum_url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3"
             result["gateway"] = "direct"
 
-        try:
-            resp = requests.get(enum_url, headers=headers, timeout=15, verify=True)
-        except requests.RequestException as e:
-            result["error"] = str(e)
-            return result
-
-        if resp.status_code == 200:
-            body = resp.text
-            if "tenantId" in body:
-                try:
-                    users_found = resp.json()
-                    if isinstance(users_found, list) and len(users_found) > 0:
-                        for user_obj in users_found:
-                            tenant_id = user_obj.get("tenantId")
-                            coex_mode = (user_obj.get("featureSettings") or {}).get("coExistenceMode", "")
-                            display_name = user_obj.get("displayName", "")
-                            upn = user_obj.get("userPrincipalName", "")
-
-                            # Validation logic from TeamFiltration:
-                            # tenant must not be null, coExistenceMode must not be "Unknown",
-                            # and either displayName != email OR upn matches
-                            if (
-                                tenant_id is not None
-                                and coex_mode != "Unknown"
-                                and (display_name.lower() != email.lower() or upn.lower() == email.lower())
-                            ):
-                                result["valid"] = True
-                                result["object_id"] = user_obj.get("objectId")
-                                result["display_name"] = display_name
-                                result["upn"] = upn
-                                result["tenant_id"] = tenant_id
-                                result["mri"] = user_obj.get("mri")
-
-                                # Only fetch presence inline if explicitly requested
-                                if fetch_presence:
-                                    ooo = self._fetch_presence(user_obj.get("mri"))
-                                    if ooo:
-                                        result["out_of_office"] = ooo.get("message")
-                                        result["presence"] = ooo.get("availability")
-                                return result
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-            return result
-
-        elif resp.status_code == 403:
-            # As of 2023, Microsoft returns 403 for some valid users
-            # TeamFiltration treats 403 with body {"errorCode":"Forbidden"} as valid
+        for attempt in range(max_retries + 1):
             try:
-                err_body = resp.json()
-                if err_body.get("errorCode") == "Forbidden":
-                    result["valid"] = True
-                    return result
-            except (json.JSONDecodeError, AttributeError):
-                pass
-            return result
+                resp = requests.get(enum_url, headers=headers, timeout=15, verify=True)
+            except requests.RequestException as e:
+                result["error"] = str(e)
+                if attempt < max_retries:
+                    # Rotate to a different gateway on retry
+                    if self.teams_apim_manager:
+                        gateway_url = self.teams_apim_manager.get_next_url()
+                        if not gateway_url.endswith("/"):
+                            gateway_url += "/"
+                        enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
+                        result["gateway"] = urlparse(gateway_url).netloc
+                    time.sleep(0.5)
+                    continue
+                return result
 
-        elif resp.status_code == 500:
-            result["error"] = "HTTP 500 -- server error (may be transient)"
-            return result
+            # Token expired — signal caller to re-auth
+            if resp.status_code == 401:
+                result["error"] = "HTTP 401 -- token expired"
+                result["token_expired"] = True
+                return result
 
-        else:
-            result["error"] = f"HTTP {resp.status_code}"
-            return result
+            if resp.status_code == 200:
+                body = resp.text
+                if "tenantId" in body:
+                    try:
+                        users_found = resp.json()
+                        if isinstance(users_found, list) and len(users_found) > 0:
+                            for user_obj in users_found:
+                                tenant_id = user_obj.get("tenantId")
+                                coex_mode = (user_obj.get("featureSettings") or {}).get("coExistenceMode", "")
+                                display_name = user_obj.get("displayName", "")
+                                upn = user_obj.get("userPrincipalName", "")
+
+                                if (
+                                    tenant_id is not None
+                                    and coex_mode != "Unknown"
+                                    and (display_name.lower() != email.lower() or upn.lower() == email.lower())
+                                ):
+                                    result["valid"] = True
+                                    result["object_id"] = user_obj.get("objectId")
+                                    result["display_name"] = display_name
+                                    result["upn"] = upn
+                                    result["tenant_id"] = tenant_id
+                                    result["mri"] = user_obj.get("mri")
+
+                                    if fetch_presence:
+                                        ooo = self._fetch_presence(user_obj.get("mri"))
+                                        if ooo:
+                                            result["out_of_office"] = ooo.get("message")
+                                            result["presence"] = ooo.get("availability")
+                                    return result
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass
+                return result
+
+            elif resp.status_code == 403:
+                try:
+                    err_body = resp.json()
+                    if err_body.get("errorCode") == "Forbidden":
+                        result["valid"] = True
+                        return result
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                return result
+
+            elif resp.status_code == 500:
+                result["error"] = "HTTP 500 -- server error (transient)"
+                if attempt < max_retries:
+                    # Rotate gateway and retry
+                    if self.teams_apim_manager:
+                        gateway_url = self.teams_apim_manager.get_next_url()
+                        if not gateway_url.endswith("/"):
+                            gateway_url += "/"
+                        enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
+                        result["gateway"] = urlparse(gateway_url).netloc
+                    time.sleep(0.5)
+                    continue
+                return result
+
+            else:
+                result["error"] = f"HTTP {resp.status_code}"
+                return result
+
+        return result
 
     def _fetch_presence(self, mri):
         """
@@ -891,6 +925,27 @@ def process_enum_attempt(
     if stop_event.is_set():
         return
     result = teams_enumerator.enumerate_user(email, fetch_presence=False)
+
+    # Handle token expiry — re-authenticate and retry once
+    if result.get("token_expired"):
+        with lock:
+            # Only one thread should re-auth; check if another already did
+            # by testing with a quick call after re-acquiring the lock
+            if not teams_enumerator._reauth_in_progress:
+                teams_enumerator._reauth_in_progress = True
+                try:
+                    print_warn("Token expired — re-authenticating sacrificial account...")
+                    teams_enumerator.authenticate_sacrificial(
+                        teams_enumerator._sac_user,
+                        teams_enumerator._sac_pass,
+                        teams_enumerator._tenant,
+                    )
+                    teams_enumerator.acquire_skype_token()
+                finally:
+                    teams_enumerator._reauth_in_progress = False
+
+        # Retry after re-auth
+        result = teams_enumerator.enumerate_user(email, fetch_presence=False)
 
     if result["valid"]:
         with lock:
