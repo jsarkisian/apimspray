@@ -930,7 +930,8 @@ def process_attempt(
 
 def process_enum_attempt(
     email, teams_enumerator, pace_config, logger,
-    valid_users_set, valid_mris, lock, stop_event,
+    valid_users_set, valid_mris, counters, counters_lock,
+    lock, stop_event,
 ):
     if stop_event.is_set():
         return
@@ -959,7 +960,13 @@ def process_enum_attempt(
         result = teams_enumerator.enumerate_user(email, fetch_presence=False)
         # If still expired after re-auth, give up on this user
         if result.get("token_expired"):
+            with counters_lock:
+                counters["errors"] += 1
             return
+
+    # Count every user that got a definitive response
+    with counters_lock:
+        counters["checked"] += 1
 
     if result["valid"]:
         with lock:
@@ -979,6 +986,9 @@ def process_enum_attempt(
             "tenant_id": result.get("tenant_id"),
             "mri": result.get("mri"),
         })
+    elif result.get("error"):
+        with counters_lock:
+            counters["errors"] += 1
 
 
 # ============================================================================
@@ -1300,23 +1310,25 @@ def _run_enumerate(args):
         progress_tracker.begin_session(len(users))
         progress_tracker.begin_round(len(users), label="Enumerating")
 
+    # Thread-safe counters
+    counters = {"submitted": 0, "completed": 0, "checked": 0, "errors": 0}
+    counters_lock = threading.Lock()
+
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
     sys.stdout.flush()
 
-    # Submit all users to the thread pool. With workers capped at 50-100,
-    # only that many run concurrently — the rest queue internally.
-    # Progress is tracked via callbacks so we don't need as_completed.
-    completed_count = [0]  # mutable for closure access
-
     def _on_done(f):
+        with counters_lock:
+            counters["completed"] += 1
         try:
             f.result()
         except Exception as e:
+            with counters_lock:
+                counters["errors"] += 1
             print_warn(f"Enum worker error: {e}")
         finally:
             if progress_tracker:
                 progress_tracker.increment()
-            completed_count[0] += 1
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for email in users:
@@ -1330,9 +1342,11 @@ def _run_enumerate(args):
                     current_delay += random.uniform(-jitter_val, jitter_val)
                     current_delay = max(0, current_delay)
                 time.sleep(current_delay)
+            counters["submitted"] += 1
             future = executor.submit(
                 process_enum_attempt, email, enumerator, enum_pace,
-                logger, valid_users_set, valid_mris, lock, stop_event,
+                logger, valid_users_set, valid_mris, counters, counters_lock,
+                lock, stop_event,
             )
             future.add_done_callback(_on_done)
         # Exiting the with block waits for all submitted futures to complete
@@ -1379,7 +1393,7 @@ def _run_enumerate(args):
 
         print_success("Presence/OOO pass complete")
 
-    _print_enum_summary(logger, valid_users_set, users)
+    _print_enum_summary(logger, valid_users_set, users, counters)
 
 
 def _print_summary(logger, locked_users, invalid_users):
@@ -1396,13 +1410,27 @@ def _print_summary(logger, locked_users, invalid_users):
     print(style("--------------------------", TermColors.BOLD, TermColors.CYAN))
 
 
-def _print_enum_summary(logger, valid_users, all_users):
+def _print_enum_summary(logger, valid_users, all_users, counters):
     print("\n" + style("--- Enumeration Summary ---", TermColors.BOLD, TermColors.CYAN))
-    enum_count = sum(1 for _ in open(logger.files["enumerated"])) if logger.files["enumerated"].exists() else 0
-    failed_count = sum(1 for _ in open(logger.files["failed"])) if logger.files["failed"].exists() else 0
+    submitted = counters["submitted"]
+    completed = counters["completed"]
+    checked = counters["checked"]
+    errors = counters["errors"]
+    valid = len(valid_users)
+    not_valid = checked - valid
+    missed = submitted - completed
+
     print(f"Total Candidates:    {style(str(len(all_users)), TermColors.BOLD)}")
-    print(f"Valid Users Found:   {style(str(enum_count), TermColors.GREEN, TermColors.BOLD)}")
-    print(f"Errors:              {style(str(failed_count), TermColors.RED)}")
+    print(f"Submitted:           {style(str(submitted), TermColors.BOLD)}")
+    print(f"Completed:           {style(str(completed), TermColors.BOLD)}")
+    print(f"Checked (definitive): {style(str(checked), TermColors.BOLD)}")
+    print(f"Valid Users Found:   {style(str(valid), TermColors.GREEN, TermColors.BOLD)}")
+    print(f"Not Valid:           {style(str(not_valid), TermColors.DIM)}")
+    print(f"Errors/Timeouts:     {style(str(errors), TermColors.YELLOW, TermColors.BOLD)}")
+    if missed > 0:
+        print(f"Missed (not run):    {style(str(missed), TermColors.RED, TermColors.BOLD)}")
+    coverage = (checked / len(all_users) * 100) if len(all_users) > 0 else 0
+    print(f"Coverage:            {style(f'{coverage:.1f}%', TermColors.CYAN, TermColors.BOLD)}")
     print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
     if logger.files["enumerated"].exists():
         print(f"Valid Users File:    {style(str(logger.files['enumerated']), TermColors.GREEN)}")
