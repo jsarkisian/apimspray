@@ -1314,47 +1314,41 @@ def _run_enumerate(args):
         progress_tracker.begin_round(len(users), label="Enumerating")
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
+    sys.stdout.flush()
 
-    # Phase 1: Fast enumeration in batches.
-    # Submit users in chunks of ~5000 to avoid creating all futures upfront
-    # while keeping the thread pool fully saturated.
-    BATCH_SIZE = max(workers * 50, 5000)
+    # Submit all users to the thread pool. With workers capped at 50-100,
+    # only that many run concurrently — the rest queue internally.
+    # Progress is tracked via callbacks so we don't need as_completed.
+    completed_count = [0]  # mutable for closure access
+
+    def _on_done(f):
+        try:
+            f.result()
+        except Exception as e:
+            print_warn(f"Enum worker error: {e}")
+        finally:
+            if progress_tracker:
+                progress_tracker.increment()
+            completed_count[0] += 1
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        total_batches = (len(users) + BATCH_SIZE - 1) // BATCH_SIZE
-        for batch_idx, batch_start in enumerate(range(0, len(users), BATCH_SIZE)):
+        for email in users:
             if stop_event.is_set():
                 break
-
-            batch = users[batch_start:batch_start + BATCH_SIZE]
-            print_info(f"Batch {batch_idx + 1}/{total_batches} ({len(batch)} users)")
-            sys.stdout.flush()
-
-            futures = []
-            for email in batch:
-                if stop_event.is_set():
-                    break
-                # Only apply delay in stealth mode
-                if base_delay > 0 and workers == 1:
-                    current_delay = base_delay
-                    if enum_pace["jitter"] > 0:
-                        jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
-                        current_delay += random.uniform(-jitter_val, jitter_val)
-                        current_delay = max(0, current_delay)
-                    time.sleep(current_delay)
-                futures.append(executor.submit(
-                    process_enum_attempt, email, enumerator, enum_pace,
-                    logger, valid_users_set, valid_mris, lock, stop_event,
-                ))
-
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception as e:
-                    print_warn(f"Enum worker error: {e}")
-                finally:
-                    if progress_tracker:
-                        progress_tracker.increment()
+            # Only apply delay in stealth mode
+            if base_delay > 0 and workers == 1:
+                current_delay = base_delay
+                if enum_pace["jitter"] > 0:
+                    jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
+                    current_delay += random.uniform(-jitter_val, jitter_val)
+                    current_delay = max(0, current_delay)
+                time.sleep(current_delay)
+            future = executor.submit(
+                process_enum_attempt, email, enumerator, enum_pace,
+                logger, valid_users_set, valid_mris, lock, stop_event,
+            )
+            future.add_done_callback(_on_done)
+        # Exiting the with block waits for all submitted futures to complete
 
     if progress_tracker:
         progress_tracker.end_round()
