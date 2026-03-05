@@ -1309,47 +1309,35 @@ def _run_enumerate(args):
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
 
-    # Phase 1: Fast enumeration using a sliding window.
-    # Submit work in chunks so we don't create 248K futures upfront.
-    # Results are processed as they complete, keeping the progress bar moving.
+    # Phase 1: Fast enumeration in batches.
+    # Submit users in chunks of ~5000 to avoid creating all futures upfront
+    # while keeping the thread pool fully saturated.
+    BATCH_SIZE = max(workers * 50, 5000)
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = set()
-        user_iter = iter(users)
-        # Fill the initial window: 2x workers keeps the pool saturated
-        window_size = workers * 2
-
-        def _submit_next():
-            """Submit the next user from the iterator. Returns True if submitted."""
+        for batch_start in range(0, len(users), BATCH_SIZE):
             if stop_event.is_set():
-                return False
-            try:
-                email = next(user_iter)
-            except StopIteration:
-                return False
-            # Only apply delay in stealth mode
-            if base_delay > 0 and workers == 1:
-                current_delay = base_delay
-                if enum_pace["jitter"] > 0:
-                    jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
-                    current_delay += random.uniform(-jitter_val, jitter_val)
-                    current_delay = max(0, current_delay)
-                time.sleep(current_delay)
-            future = executor.submit(
-                process_enum_attempt, email, enumerator, enum_pace,
-                logger, valid_users_set, valid_mris, lock, stop_event,
-            )
-            pending.add(future)
-            return True
-
-        # Prime the window
-        for _ in range(window_size):
-            if not _submit_next():
                 break
 
-        # Process completed futures and backfill new work
-        while pending:
-            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-            for f in done:
+            batch = users[batch_start:batch_start + BATCH_SIZE]
+            futures = []
+            for email in batch:
+                if stop_event.is_set():
+                    break
+                # Only apply delay in stealth mode
+                if base_delay > 0 and workers == 1:
+                    current_delay = base_delay
+                    if enum_pace["jitter"] > 0:
+                        jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
+                        current_delay += random.uniform(-jitter_val, jitter_val)
+                        current_delay = max(0, current_delay)
+                    time.sleep(current_delay)
+                futures.append(executor.submit(
+                    process_enum_attempt, email, enumerator, enum_pace,
+                    logger, valid_users_set, valid_mris, lock, stop_event,
+                ))
+
+            for f in as_completed(futures):
                 try:
                     f.result()
                 except Exception as e:
@@ -1357,8 +1345,6 @@ def _run_enumerate(args):
                 finally:
                     if progress_tracker:
                         progress_tracker.increment()
-                # Backfill: submit one new task for each completed one
-                _submit_next()
 
     if progress_tracker:
         progress_tracker.end_round()
