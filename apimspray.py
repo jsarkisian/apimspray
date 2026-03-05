@@ -805,19 +805,33 @@ class TeamsEnumerator:
         fake_num = random.randint(10000, 99999)
         fake_user = f"{fake_first}.{fake_last}{fake_num}@{sample_domain}"
         print_info(f"Running sanity check with: {fake_user}")
-        result = self.enumerate_user(fake_user, max_retries=0)
-        if result.get("token_expired"):
-            print_error("Sanity check got 401 -- token may be invalid for Teams API. Check sacrificial account has a Teams license.")
-            return False
-        if result.get("error"):
-            print_warn(f"Sanity check returned error: {result['error']} -- proceeding anyway")
-            return True
-        if result["valid"]:
-            print_error("Sanity check FAILED -- fake user returned as valid. Enumeration unreliable for this tenant.")
-            return False
-        else:
-            print_success("Sanity check PASSED -- enumeration is viable for this tenant")
-            return True
+
+        # Try up to 3 times — sanity check should get a definitive answer
+        for attempt in range(3):
+            result = self.enumerate_user(fake_user, max_retries=0)
+
+            if result.get("token_expired"):
+                print_error("Sanity check got 401 -- token may be invalid for Teams API. Check sacrificial account has a Teams license.")
+                return False
+
+            if result.get("error"):
+                if attempt < 2:
+                    print_warn(f"Sanity check attempt {attempt + 1} returned: {result['error']} -- retrying in 3s...")
+                    time.sleep(3)
+                    continue
+                else:
+                    print_warn(f"Sanity check returned error after 3 attempts: {result['error']}")
+                    print_warn("Gateways may be under pressure -- expect higher retry rates during enumeration")
+                    return True
+
+            if result["valid"]:
+                print_error("Sanity check FAILED -- fake user returned as valid. Enumeration unreliable for this tenant.")
+                return False
+            else:
+                print_success("Sanity check PASSED -- enumeration is viable for this tenant")
+                return True
+
+        return True
 
 
 # ============================================================================
