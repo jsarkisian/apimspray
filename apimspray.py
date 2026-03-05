@@ -946,7 +946,7 @@ def process_attempt(
 
 def process_enum_attempt(
     email, teams_enumerator, pace_config, logger,
-    valid_users_set, valid_mris, counters, counters_lock,
+    valid_users_set, valid_mris, failed_users_list, counters, counters_lock,
     lock, stop_event,
 ):
     if stop_event.is_set():
@@ -974,13 +974,22 @@ def process_enum_attempt(
 
         # Retry with fresh token
         result = teams_enumerator.enumerate_user(email, fetch_presence=False)
-        # If still expired after re-auth, give up on this user
         if result.get("token_expired"):
+            with lock:
+                failed_users_list.append(email)
             with counters_lock:
                 counters["errors"] += 1
             return
 
-    # Count every user that got a definitive response
+    # If there was an error (timeout, connection, 429, 500), track for retry
+    if result.get("error"):
+        with lock:
+            failed_users_list.append(email)
+        with counters_lock:
+            counters["errors"] += 1
+        return
+
+    # Definitive response — count it
     with counters_lock:
         counters["checked"] += 1
 
@@ -1002,9 +1011,6 @@ def process_enum_attempt(
             "tenant_id": result.get("tenant_id"),
             "mri": result.get("mri"),
         })
-    elif result.get("error"):
-        with counters_lock:
-            counters["errors"] += 1
 
 
 # ============================================================================
@@ -1318,58 +1324,85 @@ def _run_enumerate(args):
             print_warn("Cannot determine domain for sanity check -- skipping")
 
     valid_users_set = set()
-    valid_mris = {}  # email -> mri, collected for post-enum presence pass
+    valid_mris = {}
     lock = threading.Lock()
     stop_event = threading.Event()
-    progress_tracker = ProgressTracker() if args.verbose else None
-    if progress_tracker:
-        progress_tracker.begin_session(len(users))
-        progress_tracker.begin_round(len(users), label="Enumerating")
 
-    # Thread-safe counters
     counters = {"submitted": 0, "completed": 0, "checked": 0, "errors": 0}
     counters_lock = threading.Lock()
 
-    print_info(f"Beginning enumeration of {len(users)} candidate users...")
-    sys.stdout.flush()
+    # Multi-pass enumeration: fast first pass, then retry failures with lower concurrency
+    MAX_PASSES = 3
+    current_user_list = list(users)
 
-    def _on_done(f):
+    for pass_num in range(1, MAX_PASSES + 1):
+        if not current_user_list or stop_event.is_set():
+            break
+
+        # Reduce concurrency on retry passes to avoid overwhelming gateways
+        if pass_num == 1:
+            pass_workers = workers
+        else:
+            pass_workers = max(10, workers // (pass_num * 2))
+
+        pass_label = f"Pass {pass_num}/{MAX_PASSES}" if MAX_PASSES > 1 else "Enumerating"
+        print_info(f"{pass_label}: {style(str(len(current_user_list)), TermColors.MAGENTA, TermColors.BOLD)} users, {style(str(pass_workers), TermColors.MAGENTA, TermColors.BOLD)} workers")
+        sys.stdout.flush()
+
+        progress_tracker = ProgressTracker() if args.verbose else None
+        if progress_tracker:
+            progress_tracker.begin_session(len(current_user_list))
+            progress_tracker.begin_round(len(current_user_list), label=pass_label)
+
+        failed_users_list = []  # thread-safe via lock
+
+        def _make_on_done(tracker):
+            def _on_done(f):
+                with counters_lock:
+                    counters["completed"] += 1
+                try:
+                    f.result()
+                except Exception as e:
+                    print_warn(f"Enum worker error: {e}")
+                finally:
+                    if tracker:
+                        tracker.increment()
+            return _on_done
+
+        on_done = _make_on_done(progress_tracker)
+
+        with ThreadPoolExecutor(max_workers=pass_workers) as executor:
+            for email in current_user_list:
+                if stop_event.is_set():
+                    break
+                if base_delay > 0 and pass_workers == 1:
+                    current_delay = base_delay
+                    if enum_pace["jitter"] > 0:
+                        jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
+                        current_delay += random.uniform(-jitter_val, jitter_val)
+                        current_delay = max(0, current_delay)
+                    time.sleep(current_delay)
+                counters["submitted"] += 1
+                future = executor.submit(
+                    process_enum_attempt, email, enumerator, enum_pace,
+                    logger, valid_users_set, valid_mris, failed_users_list,
+                    counters, counters_lock, lock, stop_event,
+                )
+                future.add_done_callback(on_done)
+
+        if progress_tracker:
+            progress_tracker.end_round()
+            progress_tracker.end_session()
+
+        if not failed_users_list or stop_event.is_set():
+            break
+
+        # Set up retry with failed users
+        current_user_list = list(failed_users_list)
+        print_warn(f"{len(current_user_list)} users failed — retrying...")
+        # Reset error counter for the retry pass
         with counters_lock:
-            counters["completed"] += 1
-        try:
-            f.result()
-        except Exception as e:
-            with counters_lock:
-                counters["errors"] += 1
-            print_warn(f"Enum worker error: {e}")
-        finally:
-            if progress_tracker:
-                progress_tracker.increment()
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for email in users:
-            if stop_event.is_set():
-                break
-            # Only apply delay in stealth mode
-            if base_delay > 0 and workers == 1:
-                current_delay = base_delay
-                if enum_pace["jitter"] > 0:
-                    jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
-                    current_delay += random.uniform(-jitter_val, jitter_val)
-                    current_delay = max(0, current_delay)
-                time.sleep(current_delay)
-            counters["submitted"] += 1
-            future = executor.submit(
-                process_enum_attempt, email, enumerator, enum_pace,
-                logger, valid_users_set, valid_mris, counters, counters_lock,
-                lock, stop_event,
-            )
-            future.add_done_callback(_on_done)
-        # Exiting the with block waits for all submitted futures to complete
-
-    if progress_tracker:
-        progress_tracker.end_round()
-        progress_tracker.end_session()
+            counters["errors"] = 0
 
     # Phase 2: Presence/OOO pass (only for valid users, runs after enum completes)
     if not args.no_presence and valid_mris:
