@@ -797,7 +797,13 @@ class TeamsEnumerator:
         If it comes back valid, the method is unreliable for this tenant.
         Returns True if sanity check PASSES (enumeration is usable).
         """
-        fake_user = f"ThisUserShouldNotExist_{uuid.uuid4().hex[:8]}@{sample_domain}"
+        # Generate a realistic-looking but guaranteed-nonexistent username
+        first_names = ["james","mary","john","patricia","robert","jennifer","michael","linda","david","elizabeth"]
+        last_names = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
+        fake_first = random.choice(first_names)
+        fake_last = random.choice(last_names)
+        fake_num = random.randint(10000, 99999)
+        fake_user = f"{fake_first}.{fake_last}{fake_num}@{sample_domain}"
         print_info(f"Running sanity check with: {fake_user}")
         result = self.enumerate_user(fake_user, max_retries=0)
         if result.get("token_expired"):
