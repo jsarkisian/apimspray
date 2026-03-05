@@ -240,13 +240,13 @@ class ProgressTracker:
         self._global_completed = 0
         self._global_start_time = None
 
-    def begin_session(self, overall_total):
+    def begin_session(self, overall_total, listen_stdin=True):
         self._global_total = overall_total
         self._global_completed = 0
         self._global_start_time = time.monotonic()
         self._stop_event.clear()
         self._active = True
-        if sys.stdin.isatty():
+        if listen_stdin and sys.stdin.isatty():
             self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
             self._listener_thread.start()
 
@@ -254,7 +254,8 @@ class ProgressTracker:
         self._stop_event.set()
         self._active = False
         if self._listener_thread:
-            self._listener_thread.join(timeout=1)
+            # Don't join — the daemon thread will die with the process.
+            # Joining a thread blocked on stdin.readline() can hang indefinitely.
             self._listener_thread = None
 
     def begin_round(self, total, label="Spraying"):
@@ -273,13 +274,18 @@ class ProgressTracker:
             self._completed += n
 
     def _listen_loop(self):
+        """Background thread: waits for Enter key, prints progress on demand.
+        Uses select() with the stop event pipe so it can be interrupted cleanly."""
         while not self._stop_event.is_set():
             try:
+                ready = _stdin_ready(timeout=0.5)
                 if self._stop_event.is_set():
                     break
-                ready = _stdin_ready(timeout=0.5)
                 if ready:
-                    sys.stdin.readline()
+                    try:
+                        sys.stdin.readline()
+                    except (OSError, ValueError):
+                        break
                     if self._active and not self._stop_event.is_set():
                         self._print_progress()
             except Exception:
@@ -1282,7 +1288,7 @@ def _run_enumerate(args):
     stop_event = threading.Event()
     progress_tracker = ProgressTracker() if args.verbose else None
     if progress_tracker:
-        progress_tracker.begin_session(len(users))
+        progress_tracker.begin_session(len(users), listen_stdin=False)
         progress_tracker.begin_round(len(users), label="Enumerating")
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
