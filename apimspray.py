@@ -240,13 +240,13 @@ class ProgressTracker:
         self._global_completed = 0
         self._global_start_time = None
 
-    def begin_session(self, overall_total, listen_stdin=True):
+    def begin_session(self, overall_total):
         self._global_total = overall_total
         self._global_completed = 0
         self._global_start_time = time.monotonic()
         self._stop_event.clear()
         self._active = True
-        if listen_stdin and sys.stdin.isatty():
+        if sys.stdin.isatty():
             self._listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
             self._listener_thread.start()
 
@@ -1304,7 +1304,7 @@ def _run_enumerate(args):
     stop_event = threading.Event()
     progress_tracker = ProgressTracker() if args.verbose else None
     if progress_tracker:
-        progress_tracker.begin_session(len(users), listen_stdin=False)
+        progress_tracker.begin_session(len(users))
         progress_tracker.begin_round(len(users), label="Enumerating")
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
