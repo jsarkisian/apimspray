@@ -509,7 +509,7 @@ class TeamsEnumerator:
         self.bearer_token = None
         self.skype_token = None
         self._lock = threading.Lock()
-        self._reauth_in_progress = False
+        self._reauth_lock = threading.Lock()
         # Stored for mid-run re-authentication on token expiry
         self._sac_user = None
         self._sac_pass = None
@@ -632,18 +632,13 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
-    def enumerate_user(self, email, fetch_presence=False, max_retries=2):
+    def enumerate_user(self, email, fetch_presence=False, max_retries=3):
         """
         Check if a user exists via the Teams externalsearchv3 endpoint.
         Routes through APIM gateways when available, falls back to direct.
 
-        When fetch_presence=False (default), skips the inline presence call
-        to keep enumeration fast. Presence can be fetched in a separate pass.
-
-        Retries on transient failures (HTTP 500, timeouts) up to max_retries.
+        Retries on transient failures (HTTP 500, 429, timeouts) up to max_retries.
         Detects token expiry (HTTP 401) and signals for re-authentication.
-
-        Returns a dict with enumeration results.
         """
         result = {
             "email": email,
@@ -660,33 +655,33 @@ class TeamsEnumerator:
             "token_expired": False,
         }
 
-        headers = self._get_auth_headers()
+        def _build_url():
+            if self.teams_apim_manager:
+                gw = self.teams_apim_manager.get_next_url()
+                if not gw.endswith("/"):
+                    gw += "/"
+                url = f"{gw}{self.region}/beta/users/{email}/externalsearchv3"
+                host = urlparse(gw).netloc
+            else:
+                url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3"
+                host = "direct"
+            return url, host
 
-        # Build the enum URL -- route through Teams APIM if available
-        if self.teams_apim_manager:
-            gateway_url = self.teams_apim_manager.get_next_url()
-            if not gateway_url.endswith("/"):
-                gateway_url += "/"
-            enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
-            result["gateway"] = urlparse(gateway_url).netloc
-        else:
-            enum_url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3"
-            result["gateway"] = "direct"
+        enum_url, gw_host = _build_url()
+        result["gateway"] = gw_host
 
         for attempt in range(max_retries + 1):
+            # Refresh headers each attempt (picks up new tokens after re-auth)
+            headers = self._get_auth_headers()
+
             try:
                 resp = requests.get(enum_url, headers=headers, timeout=15, verify=True)
             except requests.RequestException as e:
                 result["error"] = str(e)
                 if attempt < max_retries:
-                    # Rotate to a different gateway on retry
-                    if self.teams_apim_manager:
-                        gateway_url = self.teams_apim_manager.get_next_url()
-                        if not gateway_url.endswith("/"):
-                            gateway_url += "/"
-                        enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
-                        result["gateway"] = urlparse(gateway_url).netloc
-                    time.sleep(0.5)
+                    enum_url, gw_host = _build_url()
+                    result["gateway"] = gw_host
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 return result
 
@@ -694,6 +689,21 @@ class TeamsEnumerator:
             if resp.status_code == 401:
                 result["error"] = "HTTP 401 -- token expired"
                 result["token_expired"] = True
+                return result
+
+            # Rate limited by APIM or Teams — backoff and retry
+            if resp.status_code == 429:
+                result["error"] = "HTTP 429 -- rate limited"
+                if attempt < max_retries:
+                    retry_after = 2
+                    try:
+                        retry_after = int(resp.headers.get("Retry-After", 2))
+                    except (ValueError, TypeError):
+                        pass
+                    enum_url, gw_host = _build_url()
+                    result["gateway"] = gw_host
+                    time.sleep(min(retry_after, 10))
+                    continue
                 return result
 
             if resp.status_code == 200:
@@ -743,19 +753,20 @@ class TeamsEnumerator:
             elif resp.status_code == 500:
                 result["error"] = "HTTP 500 -- server error (transient)"
                 if attempt < max_retries:
-                    # Rotate gateway and retry
-                    if self.teams_apim_manager:
-                        gateway_url = self.teams_apim_manager.get_next_url()
-                        if not gateway_url.endswith("/"):
-                            gateway_url += "/"
-                        enum_url = f"{gateway_url}{self.region}/beta/users/{email}/externalsearchv3"
-                        result["gateway"] = urlparse(gateway_url).netloc
-                    time.sleep(0.5)
+                    enum_url, gw_host = _build_url()
+                    result["gateway"] = gw_host
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 return result
 
             else:
                 result["error"] = f"HTTP {resp.status_code}"
+                # Retry unknown errors too — could be transient APIM issues
+                if attempt < max_retries:
+                    enum_url, gw_host = _build_url()
+                    result["gateway"] = gw_host
+                    time.sleep(0.5)
+                    continue
                 return result
 
         return result
@@ -934,23 +945,22 @@ def process_enum_attempt(
 
     # Handle token expiry — re-authenticate and retry once
     if result.get("token_expired"):
-        with lock:
-            # Only one thread should re-auth; check if another already did
-            # by testing with a quick call after re-acquiring the lock
-            if not teams_enumerator._reauth_in_progress:
-                teams_enumerator._reauth_in_progress = True
-                try:
-                    print_warn("Token expired — re-authenticating sacrificial account...")
-                    teams_enumerator.authenticate_sacrificial(
-                        teams_enumerator._sac_user,
-                        teams_enumerator._sac_pass,
-                        teams_enumerator._tenant,
-                    )
-                    teams_enumerator.acquire_skype_token()
-                finally:
-                    teams_enumerator._reauth_in_progress = False
+        # Capture the token that failed
+        stale_token = teams_enumerator.bearer_token
 
-        # Retry after re-auth
+        with teams_enumerator._reauth_lock:
+            # If the token is still the same stale one, we need to re-auth.
+            # If another thread already refreshed it, the tokens won't match — skip.
+            if teams_enumerator.bearer_token == stale_token:
+                print_warn("Token expired — re-authenticating sacrificial account...")
+                teams_enumerator.authenticate_sacrificial(
+                    teams_enumerator._sac_user,
+                    teams_enumerator._sac_pass,
+                    teams_enumerator._tenant,
+                )
+                teams_enumerator.acquire_skype_token()
+
+        # Retry with fresh token
         result = teams_enumerator.enumerate_user(email, fetch_presence=False)
 
     if result["valid"]:
