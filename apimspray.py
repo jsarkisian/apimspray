@@ -17,7 +17,7 @@ import requests
 import itertools
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -1309,12 +1309,23 @@ def _run_enumerate(args):
 
     print_info(f"Beginning enumeration of {len(users)} candidate users...")
 
-    # Phase 1: Fast enumeration (no inline presence fetch, minimal delays)
+    # Phase 1: Fast enumeration using a sliding window.
+    # Submit work in chunks so we don't create 248K futures upfront.
+    # Results are processed as they complete, keeping the progress bar moving.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = []
-        for email in users:
+        pending = set()
+        user_iter = iter(users)
+        # Fill the initial window: 2x workers keeps the pool saturated
+        window_size = workers * 2
+
+        def _submit_next():
+            """Submit the next user from the iterator. Returns True if submitted."""
             if stop_event.is_set():
-                break
+                return False
+            try:
+                email = next(user_iter)
+            except StopIteration:
+                return False
             # Only apply delay in stealth mode
             if base_delay > 0 and workers == 1:
                 current_delay = base_delay
@@ -1327,15 +1338,27 @@ def _run_enumerate(args):
                 process_enum_attempt, email, enumerator, enum_pace,
                 logger, valid_users_set, valid_mris, lock, stop_event,
             )
-            futures.append(future)
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                print_warn(f"Enum worker error: {e}")
-            finally:
-                if progress_tracker:
-                    progress_tracker.increment()
+            pending.add(future)
+            return True
+
+        # Prime the window
+        for _ in range(window_size):
+            if not _submit_next():
+                break
+
+        # Process completed futures and backfill new work
+        while pending:
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for f in done:
+                try:
+                    f.result()
+                except Exception as e:
+                    print_warn(f"Enum worker error: {e}")
+                finally:
+                    if progress_tracker:
+                        progress_tracker.increment()
+                # Backfill: submit one new task for each completed one
+                _submit_next()
 
     if progress_tracker:
         progress_tracker.end_round()
