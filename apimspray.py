@@ -857,13 +857,19 @@ def process_attempt(
     gateway_url = apim_manager.get_next_url()
     status_code, response_text, aadsts = perform_auth(target, gateway_url, tenant, app_config)
 
+    # Handle User Not Found (50034) — log it, mark user, and return early
     if aadsts == USER_NOT_FOUND_ERROR:
         with lock:
             if target.username not in invalid_users_set:
                 invalid_users_set.add(target.username)
-                if sys.stdout.isatty():
-                    print(f"\r{style('[!]', TermColors.YELLOW, TermColors.BOLD)} User Not Found: {target.username} (Total: {len(invalid_users_set)})", end="", flush=True)
+        classification = "FAILED (User Not Found)"
+        timestamp = utc_now_str()
+        file_msg = build_file_message(target, aadsts, classification, gateway_url)
+        console_msg = f"{style('[!]', TermColors.YELLOW, TermColors.BOLD)} {style(target.username, TermColors.YELLOW)} | {style(classification, TermColors.YELLOW)}"
+        logger.log_result("failed", file_msg, console_msg)
+        return
 
+    # Handle Smart Lockout (50053)
     if aadsts == SMART_LOCKOUT_ERROR:
         is_slow_pace = pace_config["delay"] >= 2
         with lock:
@@ -895,6 +901,7 @@ def process_attempt(
             logger.log_result("blocked", file_msg)
             return
 
+    # Classify the result
     classification = "UNKNOWN"
     if aadsts:
         classification = get_status_from_aadsts(aadsts)
@@ -1404,11 +1411,17 @@ def _print_summary(logger, locked_users, invalid_users):
     valid_count = sum(1 for _ in open(logger.files["valid"])) if logger.files["valid"].exists() else 0
     blocked_count = sum(1 for _ in open(logger.files["blocked"])) if logger.files["blocked"].exists() else 0
     failed_count = sum(1 for _ in open(logger.files["failed"])) if logger.files["failed"].exists() else 0
+    total_attempts = valid_count + blocked_count + failed_count
+    print(f"Total Attempts:      {style(str(total_attempts), TermColors.BOLD)}")
     print(f"Valid Credentials:   {style(str(valid_count), TermColors.GREEN, TermColors.BOLD)}")
     print(f"Locked/Blocked:      {style(str(blocked_count), TermColors.YELLOW, TermColors.BOLD)}")
     print(f"Failed Attempts:     {style(str(failed_count), TermColors.RED)}")
-    print(f"Locked Users:        {len(locked_users)}")
-    print(f"Invalid Users:       {len(invalid_users)}")
+    print(f"Locked Users:        {style(str(len(locked_users)), TermColors.YELLOW)}")
+    print(f"Users Not Found:     {style(str(len(invalid_users)), TermColors.YELLOW, TermColors.BOLD)}")
+    if invalid_users:
+        # List the not-found users
+        for u in sorted(invalid_users):
+            print(f"  {style('-', TermColors.DIM)} {u}")
     print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
     print(style("--------------------------", TermColors.BOLD, TermColors.CYAN))
 
