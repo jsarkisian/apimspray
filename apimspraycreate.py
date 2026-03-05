@@ -204,14 +204,19 @@ def main():
         rg_location = requested_regions[0]
         log("info", f"Using requested APIM locations: {', '.join(target_regions)}")
 
-    count = args.count if args.count else len(target_regions)
-    if count > len(target_regions):
+    count = args.count
+    if not count:
         if args.location:
-            log("warn", f"Requested count {count} exceeds selected regions {len(target_regions)}. Locations will repeat.")
+            count = len(target_regions)
         else:
-            log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Locations will repeat.")
+            die("--count is required when --location is not specified (otherwise all available regions would be used)")
+
+    if count > len(target_regions):
+        log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Locations will repeat.")
     if count < 1:
         die("Count must be at least 1")
+
+    log("info", f"Will deploy {count} login APIM instance(s)")
 
     # Config
     timestamp = int(time.time())
