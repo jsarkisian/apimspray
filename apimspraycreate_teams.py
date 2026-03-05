@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-apimspraycreate.py - Azure APIM Proxy Deployment (Python Version)
-Replicates functionality of apimsprayrotator.sh
+apimspraycreate_teams.py - Azure APIM Proxy Deployment for Teams API
+Deploys APIM instances that proxy requests to https://teams.microsoft.com/api/mt/
+for use with apimspray --mode enumerate --teams-urls
 """
 
 import argparse
@@ -38,12 +39,8 @@ def die(message):
 def run_command(command, check=True, capture_output=True, timeout=None):
     try:
         result = subprocess.run(
-            command,
-            check=check,
-            shell=True,
-            text=True,
-            capture_output=capture_output,
-            timeout=timeout
+            command, check=check, shell=True, text=True,
+            capture_output=capture_output, timeout=timeout
         )
         return result.stdout.strip() if result.stdout else ""
     except subprocess.CalledProcessError as e:
@@ -57,7 +54,6 @@ def retry_command(command, attempts=15, delay=10):
             return run_command(command)
         except subprocess.CalledProcessError:
             if i < attempts - 1:
-                # log("warn", f"Command failed, retrying in {delay}s... ({i+1}/{attempts})")
                 time.sleep(delay)
             else:
                 raise
@@ -71,7 +67,6 @@ def get_az_regions():
     output = run_command(cmd)
     if not output:
         return []
-    # Clean up and normalize
     regions = [r.strip().replace(" ", "").lower() for r in output.split('\n') if r.strip()]
     return regions
 
@@ -84,44 +79,74 @@ def parse_location_list(value):
     return [normalize_location(part) for part in value.split(",") if part.strip()]
 
 def deploy_instance(index, location, resource_group, timestamp, prefix, backend_url, product_id):
-    apim_name = f"apimspray-created-apim-{timestamp}-Number-{index}"
-    api_id = "oauth"
-    
+    """
+    Deploy a single APIM instance that proxies the Teams API.
+    The key difference from the login deployer:
+      - backend_url is https://teams.microsoft.com/api/mt
+      - The operation uses a wildcard GET path to handle /{region}/beta/users/{email}/externalsearchv3
+    """
+    apim_name = f"apimteams-created-apim-{timestamp}-Number-{index}"
+    api_id = "teamsapi"
+
     try:
         log("info", f"[{apim_name}] Creating APIM instance in {location}...")
         retry_command(
             f"az apim create --name {apim_name} --resource-group {resource_group} "
-            f"--location {location} --publisher-name Proxy --publisher-email proxy@example.com "
+            f"--location {location} --publisher-name TeamsProxy --publisher-email proxy@example.com "
             "--sku-name Consumption --no-wait",
-            attempts=3,
-            delay=20,
+            attempts=3, delay=20,
         )
 
         log("info", f"[{apim_name}] Waiting for deployment...")
         retry_command(
             f"az apim wait --name {apim_name} --resource-group {resource_group} "
             "--created --interval 10 --timeout 1800",
-            attempts=3,
-            delay=20,
+            attempts=3, delay=20,
         )
 
-        log("info", f"[{apim_name}] Creating OAuth API...")
-        retry_command(f"az apim api create --service-name {apim_name} --resource-group {resource_group} --api-id {api_id} --path {prefix} --display-name OAuth --protocols https --api-type http --service-url {backend_url}")
+        log("info", f"[{apim_name}] Creating Teams API...")
+        retry_command(
+            f"az apim api create --service-name {apim_name} --resource-group {resource_group} "
+            f"--api-id {api_id} --path {prefix} --display-name TeamsAPI --protocols https "
+            f"--api-type http --service-url {backend_url}"
+        )
 
         log("info", f"[{apim_name}] Ensuring product exists...")
         try:
-            retry_command(f"az apim product show --resource-group {resource_group} --service-name {apim_name} --product-id {product_id}", attempts=3, delay=5)
-        except:
-            retry_command(f"az apim product create --resource-group {resource_group} --service-name {apim_name} --product-id {product_id} --product-name apimspray --subscription-required false --state published")
+            retry_command(
+                f"az apim product show --resource-group {resource_group} "
+                f"--service-name {apim_name} --product-id {product_id}",
+                attempts=3, delay=5,
+            )
+        except Exception:
+            retry_command(
+                f"az apim product create --resource-group {resource_group} "
+                f"--service-name {apim_name} --product-id {product_id} "
+                f"--product-name apimteams --subscription-required false --state published"
+            )
 
         log("info", f"[{apim_name}] Attaching API to product...")
-        retry_command(f"az apim product api add --resource-group {resource_group} --service-name {apim_name} --product-id {product_id} --api-id {api_id}")
+        retry_command(
+            f"az apim product api add --resource-group {resource_group} "
+            f"--service-name {apim_name} --product-id {product_id} --api-id {api_id}"
+        )
 
-        log("info", f"[{apim_name}] Creating logon operation...")
-        retry_command(f"az apim api operation create --resource-group {resource_group} --service-name {apim_name} --api-id {api_id} --operation-id logon --url-template /common/oauth2/token --method POST --display-name logon")
+        # Create a wildcard operation to handle all GET requests under the prefix.
+        # This handles paths like: /{region}/beta/users/{email}/externalsearchv3
+        # Using a catch-all URL template with a wildcard parameter.
+        log("info", f"[{apim_name}] Creating wildcard enum operation (GET)...")
+        retry_command(
+            f"az apim api operation create --resource-group {resource_group} "
+            f"--service-name {apim_name} --api-id {api_id} "
+            f'--operation-id enumuser --url-template "/*" --method GET '
+            f'--display-name "Teams User Enum"'
+        )
 
         # Get Gateway URL
-        service_url = retry_command(f"az apim show --name {apim_name} --resource-group {resource_group} --query gatewayUrl -o tsv")
+        service_url = retry_command(
+            f"az apim show --name {apim_name} --resource-group {resource_group} "
+            "--query gatewayUrl -o tsv"
+        )
         final_url = f"{service_url}/{prefix}"
 
         log("ok", f"[{apim_name}] Ready at {final_url}/")
@@ -131,46 +156,49 @@ def deploy_instance(index, location, resource_group, timestamp, prefix, backend_
         log("error", f"[{apim_name}] Failed: {e}")
         return (index, location, False, None)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="apimspraycreate - Azure APIM Deployer")
-    parser.add_argument("--outfile", required=False, help="Output file for URLs")
-    parser.add_argument("--count", type=int, help="Number of instances")
+    parser = argparse.ArgumentParser(description="apimspraycreate_teams - Azure APIM Deployer for Teams API")
+    parser.add_argument("--outfile", required=False, help="Output file for Teams APIM URLs")
+    parser.add_argument("--count", type=int, help="Number of instances to deploy")
     parser.add_argument(
         "--location",
-        help=(
-            "Comma-separated APIM location(s) to deploy into. When provided, only those "
-            "regions are used and the first location is used for the resource group."
-        ),
+        help="Comma-separated APIM location(s) to deploy into.",
     )
-    parser.add_argument("--prefix", default="oauth", help="API URL prefix")
-    parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups before deploying new ones")
-    parser.add_argument("--delete-only", action="store_true", help="Only delete old resource groups, do not deploy new ones")
-    
+    parser.add_argument("--prefix", default="teamsmt", help="API URL prefix (default: teamsmt)")
+    parser.add_argument("--delete-old", action="store_true", help="Delete old Teams APIM resource groups before deploying new ones")
+    parser.add_argument("--delete-only", action="store_true", help="Only delete old Teams resource groups, do not deploy new ones")
+    parser.add_argument(
+        "--backend-url",
+        default="https://teams.microsoft.com/api/mt",
+        help="Teams API backend URL (default: https://teams.microsoft.com/api/mt)",
+    )
+
     args = parser.parse_args()
 
     # Check AZ
     try:
         run_command("az account show")
-    except:
+    except Exception:
         die("Azure CLI not logged in. Run: az login")
 
-    # Handle delete-only mode
+    # Handle delete
     if args.delete_only or args.delete_old:
-        log("info", "Checking for old resource groups...")
+        log("info", "Checking for old Teams resource groups...")
         deleted = 0
         try:
-            old_groups = run_command("az group list --query \"[?starts_with(name, 'apim-rotator-')].name\" -o tsv")
+            old_groups = run_command("az group list --query \"[?starts_with(name, 'apim-teams-rotator-')].name\" -o tsv")
             if old_groups:
                 for grp in old_groups.split():
                     log("info", f"Deleting {grp}...")
                     run_command(f"az group delete --name {grp} --yes --no-wait")
                     deleted += 1
-        except:
+        except Exception:
             pass
         if deleted > 0:
             log("ok", f"Queued {deleted} resource group(s) for deletion")
         else:
-            log("info", "No old resource groups found")
+            log("info", "No old Teams resource groups found")
         if args.delete_only:
             return
 
@@ -179,11 +207,12 @@ def main():
         die("--outfile is required when deploying new gateways")
 
     # Get Regions
+
+    # Get Regions
     log("info", "Fetching available APIM regions...")
     available_regions = get_az_regions()
     if not available_regions:
         die("No APIM regions found")
-    
     log("ok", f"Discovered {len(available_regions)} regions")
 
     target_regions = available_regions
@@ -192,44 +221,42 @@ def main():
     if args.location:
         requested_regions = parse_location_list(args.location)
         if not requested_regions:
-            die("No valid locations provided. Use comma-separated list, e.g. --location westeurope,germanynorth")
-        invalid = []
-        for loc in requested_regions:
-            if loc not in available_regions and loc not in invalid:
-                invalid.append(loc)
+            die("No valid locations provided.")
+        invalid = [loc for loc in requested_regions if loc not in available_regions]
         if invalid:
-            available_display = ", ".join(sorted(available_regions))
-            die(f"Unknown APIM region(s): {', '.join(invalid)}. Available regions: {available_display}")
+            die(f"Unknown APIM region(s): {', '.join(invalid)}")
         target_regions = requested_regions
         rg_location = requested_regions[0]
         log("info", f"Using requested APIM locations: {', '.join(target_regions)}")
 
-    count = args.count if args.count else len(target_regions)
-    if count > len(target_regions):
+    count = args.count
+    if not count:
         if args.location:
-            log("warn", f"Requested count {count} exceeds selected regions {len(target_regions)}. Locations will repeat.")
+            # Default to one per requested region
+            count = len(target_regions)
         else:
-            log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Locations will repeat.")
+            die("--count is required when --location is not specified (otherwise all available regions would be used)")
+
+    if count > len(target_regions):
+        log("warn", f"Requested count {count} exceeds regions {len(target_regions)}. Locations will repeat.")
     if count < 1:
         die("Count must be at least 1")
 
-    # Config
+    log("info", f"Will deploy {count} Teams APIM instance(s)")
+
     timestamp = int(time.time())
-    resource_group = f"apim-rotator-{timestamp}"
-    backend_url = "https://login.microsoftonline.com"
-    product_id = "apimspray-product"
+    resource_group = f"apim-teams-rotator-{timestamp}"
+    product_id = "apimteams-product"
 
     # Create RG
     log("info", f"Creating Resource Group: {resource_group}")
-    run_command(f"az group create --name {resource_group} --location {rg_location} --tags createdBy=apim-proxy")
+    run_command(f"az group create --name {resource_group} --location {rg_location} --tags createdBy=apim-teams-proxy")
     log("ok", "Resource Group Ready")
 
     # Deploy
     max_workers = min(32, count)
     max_total_attempts = max(count * 3, count + 10)
     next_index = 1
-    successful_regions = []
-    failed_regions = []
     urls = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -240,17 +267,14 @@ def main():
             for _ in range(batch_size):
                 region = target_regions[(next_index - 1) % len(target_regions)]
                 futures.append(executor.submit(
-                    deploy_instance, next_index, region, resource_group, timestamp, args.prefix, backend_url, product_id
+                    deploy_instance, next_index, region, resource_group,
+                    timestamp, args.prefix, args.backend_url, product_id
                 ))
                 next_index += 1
-
             for f in as_completed(futures):
                 idx, reg, success, url = f.result()
                 if success:
-                    successful_regions.append(reg)
                     urls.append(url)
-                else:
-                    failed_regions.append(reg)
 
     if len(urls) < count:
         log("error", f"Only created {len(urls)} of {count} instances after retries.")
@@ -262,13 +286,10 @@ def main():
     print("-" * 40)
     print(f"Resource Group : {resource_group}")
     print(f"Instances      : {count}")
-    print(f"Successful     : {len(successful_regions)}")
-    print(f"Failed         : {len(failed_regions)}")
+    print(f"Successful     : {len(urls)}")
+    print(f"Backend        : {args.backend_url}")
     print(f"URLs written   : {args.outfile}")
     print("-" * 40)
-    
-    if failed_regions:
-        log("warn", "Some deployments failed.")
 
 if __name__ == "__main__":
     try:
