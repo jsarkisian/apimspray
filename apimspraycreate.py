@@ -133,7 +133,7 @@ def deploy_instance(index, location, resource_group, timestamp, prefix, backend_
 
 def main():
     parser = argparse.ArgumentParser(description="apimspraycreate - Azure APIM Deployer")
-    parser.add_argument("--outfile", required=True, help="Output file for URLs")
+    parser.add_argument("--outfile", required=False, help="Output file for URLs")
     parser.add_argument("--count", type=int, help="Number of instances")
     parser.add_argument(
         "--location",
@@ -143,7 +143,8 @@ def main():
         ),
     )
     parser.add_argument("--prefix", default="oauth", help="API URL prefix")
-    parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups")
+    parser.add_argument("--delete-old", action="store_true", help="Delete old resource groups before deploying new ones")
+    parser.add_argument("--delete-only", action="store_true", help="Only delete old resource groups, do not deploy new ones")
     
     args = parser.parse_args()
 
@@ -152,6 +153,30 @@ def main():
         run_command("az account show")
     except:
         die("Azure CLI not logged in. Run: az login")
+
+    # Handle delete-only mode
+    if args.delete_only or args.delete_old:
+        log("info", "Checking for old resource groups...")
+        deleted = 0
+        try:
+            old_groups = run_command("az group list --query \"[?starts_with(name, 'apim-rotator-')].name\" -o tsv")
+            if old_groups:
+                for grp in old_groups.split():
+                    log("info", f"Deleting {grp}...")
+                    run_command(f"az group delete --name {grp} --yes --no-wait")
+                    deleted += 1
+        except:
+            pass
+        if deleted > 0:
+            log("ok", f"Queued {deleted} resource group(s) for deletion")
+        else:
+            log("info", "No old resource groups found")
+        if args.delete_only:
+            return
+
+    # Deploying requires --outfile
+    if not args.outfile:
+        die("--outfile is required when deploying new gateways")
 
     # Get Regions
     log("info", "Fetching available APIM regions...")
@@ -193,19 +218,6 @@ def main():
     resource_group = f"apim-rotator-{timestamp}"
     backend_url = "https://login.microsoftonline.com"
     product_id = "apimspray-product"
-    
-    # Cleanup
-    if args.delete_old:
-        log("info", "Checking for old resource groups...")
-        try:
-            old_groups = run_command("az group list --query \"[?starts_with(name, 'apim-rotator-')].name\" -o tsv")
-            if old_groups:
-                for grp in old_groups.split():
-                    if grp != resource_group:
-                        log("info", f"Deleting {grp}...")
-                        run_command(f"az group delete --name {grp} --yes --no-wait")
-        except:
-            pass
 
     # Create RG
     log("info", f"Creating Resource Group: {resource_group}")
