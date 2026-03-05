@@ -951,23 +951,28 @@ def process_enum_attempt(
 
     # Handle token expiry — re-authenticate and retry once
     if result.get("token_expired"):
-        # Capture the token that failed
         stale_token = teams_enumerator.bearer_token
 
         with teams_enumerator._reauth_lock:
-            # If the token is still the same stale one, we need to re-auth.
-            # If another thread already refreshed it, the tokens won't match — skip.
             if teams_enumerator.bearer_token == stale_token:
                 print_warn("Token expired — re-authenticating sacrificial account...")
-                teams_enumerator.authenticate_sacrificial(
+                ok = teams_enumerator.authenticate_sacrificial(
                     teams_enumerator._sac_user,
                     teams_enumerator._sac_pass,
                     teams_enumerator._tenant,
                 )
-                teams_enumerator.acquire_skype_token()
+                if ok:
+                    teams_enumerator.acquire_skype_token()
+                else:
+                    print_error("Re-authentication failed — stopping enumeration")
+                    stop_event.set()
+                    return
 
         # Retry with fresh token
         result = teams_enumerator.enumerate_user(email, fetch_presence=False)
+        # If still expired after re-auth, give up on this user
+        if result.get("token_expired"):
+            return
 
     if result["valid"]:
         with lock:
@@ -976,6 +981,7 @@ def process_enum_attempt(
                 valid_mris[email] = result["mri"]
 
         print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(email, TermColors.GREEN, TermColors.BOLD)}")
+        sys.stdout.flush()
 
         logger.log_result("enumerated", email)
         logger.log_enum_detail({
@@ -1315,11 +1321,15 @@ def _run_enumerate(args):
     BATCH_SIZE = max(workers * 50, 5000)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for batch_start in range(0, len(users), BATCH_SIZE):
+        total_batches = (len(users) + BATCH_SIZE - 1) // BATCH_SIZE
+        for batch_idx, batch_start in enumerate(range(0, len(users), BATCH_SIZE)):
             if stop_event.is_set():
                 break
 
             batch = users[batch_start:batch_start + BATCH_SIZE]
+            print_info(f"Batch {batch_idx + 1}/{total_batches} ({len(batch)} users)")
+            sys.stdout.flush()
+
             futures = []
             for email in batch:
                 if stop_event.is_set():
