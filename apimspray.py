@@ -51,11 +51,11 @@ PACE_SETTINGS = {
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
 # TeamFiltration uses maxDegreeOfParallelism: 300 with no delays
 ENUM_PACE_SETTINGS = {
-    "high": {"workers": 100, "delay": 0, "jitter": 0},
-    "medium": {"workers": 50, "delay": 0, "jitter": 0},
-    "mid": {"workers": 50, "delay": 0, "jitter": 0},
-    "low": {"workers": 20, "delay": 0.1, "jitter": 0},
-    "stealth": {"workers": 5, "delay": 1, "jitter": 20},
+    "high": {"workers": 300, "delay": 0, "jitter": 0},
+    "medium": {"workers": 150, "delay": 0, "jitter": 0},
+    "mid": {"workers": 150, "delay": 0, "jitter": 0},
+    "low": {"workers": 50, "delay": 0, "jitter": 0},
+    "stealth": {"workers": 10, "delay": 1, "jitter": 20},
 }
 
 # Smart Lockout
@@ -514,6 +514,15 @@ class TeamsEnumerator:
         self._sac_user = None
         self._sac_pass = None
         self._tenant = "common"
+        # Shared session with large connection pool for TCP reuse
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=300,
+            max_retries=0,
+        )
+        self._session = requests.Session()
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
 
     def _get_base_headers(self):
         """Construct base headers mimicking the Teams Android client."""
@@ -569,7 +578,7 @@ class TeamsEnumerator:
         }
 
         try:
-            resp = requests.post(full_url, headers=headers, data=data, timeout=30, verify=True)
+            resp = self._session.post(full_url, headers=headers, data=data, timeout=30, verify=True)
             if resp.status_code == 200:
                 token_data = resp.json()
                 if "access_token" in token_data:
@@ -605,7 +614,7 @@ class TeamsEnumerator:
         headers["Authorization"] = f"Bearer {self.bearer_token}"
 
         try:
-            resp = requests.post(url, headers=headers, json={}, timeout=30, verify=True)
+            resp = self._session.post(url, headers=headers, json={}, timeout=30, verify=True)
             if resp.status_code == 200:
                 data = resp.json()
                 skype_token = data.get("tokens", {}).get("skypeToken")
@@ -632,13 +641,10 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
-    def enumerate_user(self, email, fetch_presence=False, max_retries=3):
+    def enumerate_user(self, email, fetch_presence=False, max_retries=1):
         """
         Check if a user exists via the Teams externalsearchv3 endpoint.
-        Routes through APIM gateways when available, falls back to direct.
-
-        Retries on transient failures (HTTP 500, 429, timeouts) up to max_retries.
-        Detects token expiry (HTTP 401) and signals for re-authentication.
+        Optimized for speed — short timeout, single retry on failure.
         """
         result = {
             "email": email,
@@ -671,39 +677,29 @@ class TeamsEnumerator:
         result["gateway"] = gw_host
 
         for attempt in range(max_retries + 1):
-            # Refresh headers each attempt (picks up new tokens after re-auth)
             headers = self._get_auth_headers()
 
             try:
-                resp = requests.get(enum_url, headers=headers, timeout=15, verify=True)
+                resp = self._session.get(enum_url, headers=headers, timeout=5, verify=True)
             except requests.RequestException as e:
                 result["error"] = str(e)
                 if attempt < max_retries:
                     enum_url, gw_host = _build_url()
                     result["gateway"] = gw_host
-                    time.sleep(0.5 * (attempt + 1))
                     continue
                 return result
 
-            # Token expired — signal caller to re-auth
             if resp.status_code == 401:
                 result["error"] = "HTTP 401 -- token expired"
                 result["token_expired"] = True
                 return result
 
-            # Rate limited by APIM or Teams — backoff and retry
             if resp.status_code == 429:
-                result["error"] = "HTTP 429 -- rate limited"
                 if attempt < max_retries:
-                    retry_after = 2
-                    try:
-                        retry_after = int(resp.headers.get("Retry-After", 2))
-                    except (ValueError, TypeError):
-                        pass
                     enum_url, gw_host = _build_url()
                     result["gateway"] = gw_host
-                    time.sleep(min(retry_after, 10))
                     continue
+                result["error"] = "HTTP 429 -- rate limited"
                 return result
 
             if resp.status_code == 200:
@@ -729,12 +725,6 @@ class TeamsEnumerator:
                                     result["upn"] = upn
                                     result["tenant_id"] = tenant_id
                                     result["mri"] = user_obj.get("mri")
-
-                                    if fetch_presence:
-                                        ooo = self._fetch_presence(user_obj.get("mri"))
-                                        if ooo:
-                                            result["out_of_office"] = ooo.get("message")
-                                            result["presence"] = ooo.get("availability")
                                     return result
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass
@@ -751,22 +741,19 @@ class TeamsEnumerator:
                 return result
 
             elif resp.status_code == 500:
-                result["error"] = "HTTP 500 -- server error (transient)"
                 if attempt < max_retries:
                     enum_url, gw_host = _build_url()
                     result["gateway"] = gw_host
-                    time.sleep(0.5 * (attempt + 1))
                     continue
+                result["error"] = "HTTP 500"
                 return result
 
             else:
-                result["error"] = f"HTTP {resp.status_code}"
-                # Retry unknown errors too — could be transient APIM issues
                 if attempt < max_retries:
                     enum_url, gw_host = _build_url()
                     result["gateway"] = gw_host
-                    time.sleep(0.5)
                     continue
+                result["error"] = f"HTTP {resp.status_code}"
                 return result
 
         return result
@@ -786,7 +773,7 @@ class TeamsEnumerator:
         payload = [{"mri": mri}]
 
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=10, verify=True)
+            resp = self._session.post(url, headers=headers, json=payload, timeout=10, verify=True)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list) and len(data) > 0:
