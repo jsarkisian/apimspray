@@ -809,7 +809,13 @@ class TeamsEnumerator:
         """
         fake_user = f"ThisUserShouldNotExist_{uuid.uuid4().hex[:8]}@{sample_domain}"
         print_info(f"Running sanity check with: {fake_user}")
-        result = self.enumerate_user(fake_user)
+        result = self.enumerate_user(fake_user, max_retries=0)
+        if result.get("token_expired"):
+            print_error("Sanity check got 401 -- token may be invalid for Teams API. Check sacrificial account has a Teams license.")
+            return False
+        if result.get("error"):
+            print_warn(f"Sanity check returned error: {result['error']} -- proceeding anyway")
+            return True
         if result["valid"]:
             print_error("Sanity check FAILED -- fake user returned as valid. Enumeration unreliable for this tenant.")
             return False
