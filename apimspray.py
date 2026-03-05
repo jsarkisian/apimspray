@@ -554,11 +554,14 @@ class TeamsEnumerator:
         self._sac_pass = password
         self._tenant = tenant
 
-        gateway_url = self.login_apim_manager.get_next_url()
-        if not gateway_url.endswith("/"):
-            gateway_url += "/"
-
-        full_url = f"{gateway_url}common/oauth2/token"
+        # Route through APIM if available, otherwise go direct
+        if self.login_apim_manager:
+            gateway_url = self.login_apim_manager.get_next_url()
+            if not gateway_url.endswith("/"):
+                gateway_url += "/"
+            full_url = f"{gateway_url}common/oauth2/token"
+        else:
+            full_url = "https://login.microsoftonline.com/common/oauth2/token"
 
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
@@ -1233,14 +1236,14 @@ def _run_enumerate(args):
         print_error("Enumerate mode requires --users (file of candidate email addresses)")
         sys.exit(1)
 
-    login_urls = []
+    login_apim = None
     if args.urls and Path(args.urls).exists():
         login_urls = load_file_lines(args.urls)
-    if not login_urls:
-        print_error("Enumerate mode requires --urls with login APIM gateways for sacrificial auth")
-        sys.exit(1)
-
-    login_apim = APIMManager(login_urls)
+        if login_urls:
+            login_apim = APIMManager(login_urls)
+            print_info(f"Login APIM gateways: {style(str(len(login_urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)")
+    if not login_apim:
+        print_info("No --urls provided -- sacrificial auth will go direct to login.microsoftonline.com")
 
     teams_apim = None
     if args.teams_urls and Path(args.teams_urls).exists():
@@ -1273,7 +1276,7 @@ def _run_enumerate(args):
     print_info(f"Mode: {style('enumerate', TermColors.MAGENTA, TermColors.BOLD)} (Teams User Enumeration)")
     print_info(f"Sacrificial Account: {style(args.sac_user, TermColors.CYAN)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
-    print_info(f"Login Gateways: {style(str(len(login_urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)")
+    print_info(f"Sacrificial Auth: {style('via APIM' if login_apim else 'direct', TermColors.MAGENTA, TermColors.BOLD)}")
     print_info(f"Workers: {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)}, Delay: {style(f'{base_delay}s', TermColors.MAGENTA, TermColors.BOLD)}")
     if not args.no_presence:
         print_info(f"Presence/OOO Fetch: {style('ENABLED (post-enum pass)', TermColors.GREEN, TermColors.BOLD)}")
