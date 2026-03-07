@@ -931,9 +931,9 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 429:
-                # Adaptive backoff: reduce the rate limiter so future requests slow down
-                token_entry.rate_limiter.throttle()
-                # Put this token in cooldown; next attempt will pick a different one
+                # Put this token in cooldown; next attempt will pick a different one.
+                # Don't reduce the rate — the fixed rate limiter already controls
+                # throughput, and the cooldown is sufficient to let the API recover.
                 retry_after = min(int(resp.headers.get("Retry-After", 10)), 60)
                 token_entry.set_cooldown(retry_after)
                 if attempt < max_retries:
@@ -943,7 +943,6 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 200:
-                token_entry.rate_limiter.recover()
                 body = resp.text
                 if "tenantId" in body:
                     try:
