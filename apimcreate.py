@@ -179,15 +179,18 @@ def main():
         f.write(bicep_content)
         bicep_path = f.name
 
+    deploy_name = f"apimcreate-{timestamp}"
     try:
-        log("info", f"Deploying {total} APIM instance(s) via Bicep (this may take 2-5 minutes)...")
+        log("info", f"Deploying {total} APIM instance(s) via Bicep...")
         run_command(
             f"az deployment group create "
             f"--resource-group {resource_group} "
             f"--template-file {bicep_path} "
-            f"--name apimcreate-{timestamp} "
+            f"--name {deploy_name} "
+            f"--no-wait"
         )
-        log("ok", "Deployment complete")
+        log("ok", "Deployment submitted — polling for progress...")
+        _poll_deployment(resource_group, deploy_name, total)
     except subprocess.CalledProcessError as e:
         die(f"Deployment failed: {e}")
     finally:
@@ -396,6 +399,77 @@ def _extract_urls_fallback(resource_group, timestamp, login_instances, teams_ins
             log("error", f"[{name}] Failed to get gateway URL")
 
     return login_urls, teams_urls
+
+
+def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval=15):
+    """Poll ARM deployment until terminal state, printing per-resource progress."""
+    start = time.monotonic()
+
+    while True:
+        time.sleep(poll_interval)
+        elapsed = int(time.monotonic() - start)
+
+        # Check overall deployment state
+        state = run_command(
+            f"az deployment group show "
+            f"--resource-group {resource_group} "
+            f"--name {deploy_name} "
+            f"--query properties.provisioningState -o tsv",
+            check=False,
+        )
+        if not state:
+            log("info", f"Waiting for deployment to register... ({elapsed}s)")
+            continue
+
+        # Count APIM service resources by provisioning state
+        ops_json = run_command(
+            f"az deployment operation list "
+            f"--resource-group {resource_group} "
+            f"--name {deploy_name} "
+            f"--query \"[?properties.targetResource.resourceType=='Microsoft.ApiManagement/service']"
+            f".properties.provisioningState\" -o json",
+            check=False,
+        )
+
+        succeeded = 0
+        running = 0
+        failed = 0
+        if ops_json:
+            try:
+                states = json.loads(ops_json)
+                for s in states:
+                    if s == "Succeeded":
+                        succeeded += 1
+                    elif s in ("Failed", "Canceled"):
+                        failed += 1
+                    else:
+                        running += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        mins, secs = divmod(elapsed, 60)
+        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+
+        if succeeded + failed > 0:
+            parts = [f"{succeeded}/{total_instances} provisioned"]
+            if running:
+                parts.append(f"{running} in progress")
+            if failed:
+                parts.append(f"{failed} failed")
+            log("info", f"{' | '.join(parts)} ({time_str})")
+        else:
+            log("info", f"Provisioning APIM instances... ({time_str})")
+
+        if state in ("Succeeded", "Failed", "Canceled"):
+            if state == "Succeeded":
+                log("ok", f"Deployment complete ({time_str})")
+            elif state == "Failed":
+                log("error", f"Deployment failed after {time_str}")
+                if failed:
+                    log("error", f"{failed} instance(s) failed to provision")
+            else:
+                log("warn", f"Deployment canceled after {time_str}")
+            return
 
 
 def _delete_old_groups():
