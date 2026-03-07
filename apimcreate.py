@@ -251,7 +251,7 @@ def generate_bicep(login_instances, teams_instances, timestamp, login_prefix, te
                        api_id="teamsapi", api_display="TeamsAPI",
                        product_id="apimteams-product", product_name="apimteams",
                        operations=[{"id": "enumuser", "method": "GET",
-                                    "url_template": "/*",
+                                    "url_template": "/{*path}",
                                     "display_name": "Teams User Enum"}],
                        output_prefix="teams")
 

@@ -53,7 +53,7 @@ PACE_SETTINGS = {
 # Actual request rate is controlled by TokenBucketRateLimiter inside enumerate_user,
 # not by submission delay. Workers control HTTP concurrency only.
 # Add more sacrificial accounts (--sac-accounts) to scale throughput linearly.
-TEAMS_ENUM_RATE_PER_TOKEN = 30.0  # req/s per token; adaptive backoff adjusts down on 429s
+TEAMS_ENUM_RATE_PER_TOKEN = 40.0  # req/s per token; adaptive backoff adjusts down on 429s
 
 ENUM_PACE_SETTINGS = {
     "high":    {"workers": 60, "delay": 0, "jitter": 0},
@@ -203,18 +203,19 @@ class TokenBucketRateLimiter:
             time.sleep(wait)
 
     def throttle(self):
-        """Reduce rate after a 429. Cuts rate by 40% each time, minimum 5 req/s."""
+        """Reduce rate after a 429. Cuts rate by 25% each time, minimum 10 req/s."""
         with self._lock:
             self._throttle_count += 1
-            self._rate = max(5.0, self._rate * 0.6)
+            self._rate = max(10.0, self._rate * 0.75)
             self._tokens = 0  # drain bucket to enforce immediate slowdown
 
     def recover(self):
         """Gradually recover rate toward base after successful requests."""
         with self._lock:
             if self._rate < self._base_rate:
-                self._rate = min(self._base_rate, self._rate * 1.1)
-                if self._rate >= self._base_rate * 0.95:
+                # Recover ~1% per success — fast enough to matter over hundreds of requests
+                self._rate = min(self._base_rate, self._rate * 1.02)
+                if self._rate >= self._base_rate * 0.98:
                     self._rate = self._base_rate
 
     @property
@@ -1644,7 +1645,11 @@ def _run_enumerate(args):
         print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
 
     effective_rate = token_count * TEAMS_ENUM_RATE_PER_TOKEN
+    # Scale workers to token count — too many workers per token causes bursts and 429s
+    # ~5 workers per token is enough to keep the rate limiter fed without contention
+    workers = min(workers, max(5, token_count * 5))
     print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
+    print_info(f"Workers adjusted to {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)} (based on token count)")
 
     if not args.skip_sanity:
         sample_domain = users[0].split("@")[1] if "@" in users[0] else args.domain
