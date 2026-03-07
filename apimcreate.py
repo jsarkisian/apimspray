@@ -331,6 +331,74 @@ def _emit_instance(lines, name, region, prefix, backend_url, api_id, api_display
     lines.append("")
 
 
+def extract_gateway_urls(resource_group, timestamp, login_instances, teams_instances, login_prefix, teams_prefix):
+    """Extract gateway URLs from deployment outputs."""
+    login_urls = []
+    teams_urls = []
+
+    deploy_name = f"apimcreate-{timestamp}"
+
+    try:
+        output_json = run_command(
+            f"az deployment group show "
+            f"--resource-group {resource_group} "
+            f"--name {deploy_name} "
+            f"--query properties.outputs -o json"
+        )
+        if not output_json:
+            log("warn", "No deployment outputs found — falling back to resource query")
+            return _extract_urls_fallback(resource_group, timestamp, login_instances, teams_instances, login_prefix, teams_prefix)
+
+        outputs = json.loads(output_json)
+        for key, val in outputs.items():
+            url = val.get("value", "")
+            if not url:
+                continue
+            if key.startswith("apimspray_"):
+                login_urls.append(url)
+            elif key.startswith("apimteams_"):
+                teams_urls.append(url)
+    except Exception as e:
+        log("warn", f"Failed to read deployment outputs: {e} — falling back to resource query")
+        return _extract_urls_fallback(resource_group, timestamp, login_instances, teams_instances, login_prefix, teams_prefix)
+
+    return login_urls, teams_urls
+
+
+def _extract_urls_fallback(resource_group, timestamp, login_instances, teams_instances, login_prefix, teams_prefix):
+    """Fallback: query each APIM instance individually for its gateway URL."""
+    login_urls = []
+    teams_urls = []
+
+    for inst in login_instances:
+        name = f"apimspray-{timestamp}-{inst['index']}"
+        try:
+            gw = run_command(
+                f"az apim show --name {name} --resource-group {resource_group} "
+                "--query gatewayUrl -o tsv"
+            )
+            if gw:
+                login_urls.append(f"{gw}/{login_prefix}/")
+                log("ok", f"[{name}] {gw}/{login_prefix}/")
+        except Exception:
+            log("error", f"[{name}] Failed to get gateway URL")
+
+    for inst in teams_instances:
+        name = f"apimteams-{timestamp}-{inst['index']}"
+        try:
+            gw = run_command(
+                f"az apim show --name {name} --resource-group {resource_group} "
+                "--query gatewayUrl -o tsv"
+            )
+            if gw:
+                teams_urls.append(f"{gw}/{teams_prefix}/")
+                log("ok", f"[{name}] {gw}/{teams_prefix}/")
+        except Exception:
+            log("error", f"[{name}] Failed to get gateway URL")
+
+    return login_urls, teams_urls
+
+
 def _delete_old_groups():
     log("info", "Checking for old resource groups...")
     deleted = 0
