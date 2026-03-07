@@ -421,22 +421,21 @@ def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval
             log("info", f"Waiting for deployment to register... ({elapsed}s)")
             continue
 
-        # Count APIM service resources by provisioning state
-        ops_json = run_command(
-            f"az deployment operation list "
+        # Count APIM instances in the resource group by provisioning state
+        res_json = run_command(
+            f"az resource list "
             f"--resource-group {resource_group} "
-            f"--name {deploy_name} "
-            f"--query \"[?properties.targetResource.resourceType=='Microsoft.ApiManagement/service']"
-            f".properties.provisioningState\" -o json",
+            f"--resource-type Microsoft.ApiManagement/service "
+            f"--query \"[].provisioningState\" -o json",
             check=False,
         )
 
         succeeded = 0
         running = 0
         failed = 0
-        if ops_json:
+        if res_json:
             try:
-                states = json.loads(ops_json)
+                states = json.loads(res_json)
                 for s in states:
                     if s == "Succeeded":
                         succeeded += 1
