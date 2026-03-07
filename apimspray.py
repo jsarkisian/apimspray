@@ -1175,7 +1175,7 @@ def main():
     )
     parser.add_argument("--urls", required=False, help="Path to APIM URLs file (login gateways, from apimcreate.py)")
     parser.add_argument("--teams-urls", required=False, help=(
-        "Path to Teams APIM URLs file (teams gateways, from apimspraycreate_teams.py).\n"
+        "Path to Teams APIM URLs file (teams gateways, from apimcreate.py --type teams).\n"
         "If not provided in enumerate mode, Teams API calls go direct (no IP rotation for enum)."
     ))
     parser.add_argument("--users", help="Path to users file")

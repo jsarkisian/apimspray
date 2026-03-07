@@ -61,39 +61,7 @@ python3 apimspray.py --help
 
 ### 1. Deploy Gateways
 
-Deploy multiple APIM Gateways into various Locations
-
-```bash
-python3 apimspraycreate.py --count 5 --outfile urls.txt
-```
-
-Deploys 33 APIM instances into Germanywestcentral and westeurope and saves to urls.txt
-
-```bash
- python3 apimspraycreate.py --location germanywestcentral,westeurope --count 33 --outfile urls.txt
-```
-
-**apimspraycreate CLI reference:**
-
-```text
-usage: apimspraycreate.py [-h] --outfile OUTFILE [--count COUNT] [--location LOCATION] [--prefix PREFIX] [--realm-prefix REALM_PREFIX] [--delete-old]
-
-apimspraycreate - Azure APIM Deployer
-
-options:
-  -h, --help            show this help message and exit
-  --outfile OUTFILE     Output file for URLs
-  --count COUNT         Number of instances
-  --location LOCATION   Comma-separated APIM location(s) to deploy into. When provided, only those regions are used and the first location is used for the resource group.
-  --prefix PREFIX       API URL prefix
-  --realm-prefix REALM_PREFIX
-                        Realm API prefix
-  --delete-old          Delete old resource groups
-```
-
-### Deploy with apimcreate.py (Recommended)
-
-Deploys all APIM instances in a single Bicep deployment for maximum speed. Replaces the per-instance sequential CLI calls with one atomic ARM deployment.
+Deploys all APIM instances in a single Bicep deployment for maximum speed.
 
 ```bash
 # Deploy 33 login gateways
@@ -176,30 +144,46 @@ options:
 ## Usage
 
 ```text
-usage: apimspray.py [-h] [--urls URLS] [--users USERS] [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT] [--domain DOMAIN] --mode {spray,validate} [--pace {stealth,low,mid,medium,high}]
-                    [--continue-on-success]
+usage: apimspray.py [-h] [--urls URLS] [--teams-urls TEAMS_URLS] [--users USERS]
+                    [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT]
+                    [--domain DOMAIN] --mode {spray,validate,enumerate}
+                    [--pace {stealth,low,mid,medium,high}] [--continue-on-success]
+                    [--randomize-users] [--verbose] [--sac-user SAC_USER]
+                    [--sac-pass SAC_PASS] [--sac-accounts SAC_ACCOUNTS]
+                    [--teams-region {amer,emea,apac}] [--no-presence] [--skip-sanity]
 
-apimspray - Entra ID Assessment Tool
+apimspray - Entra ID Assessment Tool (with Teams Enumeration)
 
 options:
   -h, --help            show this help message and exit
-  --urls URLS           Path to APIM URLs file (from apimspraycreate.py or apimsprayrotator.sh)
+  --urls URLS           Path to APIM URLs file (login gateways, from apimcreate.py)
+  --teams-urls TEAMS_URLS
+                        Path to Teams APIM URLs file (from apimcreate.py --type teams)
   --users USERS         Path to users file
   --passwords PASSWORDS
                         Path to passwords file
   --output OUTPUT       Output directory
   --tenant TENANT       Tenant ID or Domain
   --domain DOMAIN       Append domain to users if missing
-  --mode {spray,validate}
-                        Operation mode. 'spray' tests all passwords against all users (1:N). 'validate' performs 1:1 credential pair testing.
+  --mode {spray,validate,enumerate}
+                        Operation mode:
+                         - spray:      Test all passwords against all users (1:N) via APIM.
+                         - validate:   Perform 1:1 credential pair testing via APIM.
+                         - enumerate:  Enumerate valid users via Microsoft Teams external search.
   --pace {stealth,low,mid,medium,high}
-                        Pacing profile for requests and lockout management:
-                         - high:    15 workers, 0.1s delay, 10 passes/chunk, 5m lockout, 20 safe threshold
-                         - medium:  5 workers,  1.0s delay,  5 passes/chunk, 10m lockout, 10 safe threshold, 10% jitter
-                         - low:     2 workers,  5.0s delay,  2 passes/chunk, 15m lockout,  5 safe threshold, 20% jitter
-                         - stealth: 1 worker,  30.0s delay,  1 pass/chunk,   20m lockout,  1 safe threshold, 40% jitter
+                        Pacing profile for requests and lockout management.
   --continue-on-success
                         Continue the assessment even after finding valid credentials.
+  --randomize-users     Randomize user order before each round.
+  --sac-user SAC_USER   Sacrificial O365 username for Teams enumeration
+  --sac-pass SAC_PASS   Sacrificial O365 password for Teams enumeration
+  --sac-accounts SAC_ACCOUNTS
+                        Path to file with additional sacrificial accounts (user:pass per line).
+                        Each account adds ~45 req/s to the enumeration pool.
+  --teams-region {amer,emea,apac}
+                        Teams API region hint (default: amer).
+  --no-presence         Skip presence/out-of-office fetching during enumeration.
+  --skip-sanity         Skip the pre-enumeration sanity check.
 ```
 
 ### Modes
