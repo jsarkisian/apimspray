@@ -53,7 +53,7 @@ PACE_SETTINGS = {
 # Actual request rate is controlled by TokenBucketRateLimiter inside enumerate_user,
 # not by submission delay. Workers control HTTP concurrency only.
 # Add more sacrificial accounts (--sac-accounts) to scale throughput linearly.
-TEAMS_ENUM_RATE_PER_TOKEN = 45.0  # req/s per token, comfortably under Teams' ~50/s limit
+TEAMS_ENUM_RATE_PER_TOKEN = 30.0  # req/s per token; adaptive backoff adjusts down on 429s
 
 ENUM_PACE_SETTINGS = {
     "high":    {"workers": 60, "delay": 0, "jitter": 0},
@@ -175,14 +175,18 @@ class APIMManager:
 
 class TokenBucketRateLimiter:
     """
-    Thread-safe token bucket rate limiter.
+    Thread-safe token bucket rate limiter with adaptive backoff.
     Allows up to `rate` acquisitions per second; blocks callers when the bucket is empty.
+    On 429s, call throttle() to temporarily reduce the rate, then recover over time.
     """
-    def __init__(self, rate):
+    def __init__(self, rate, max_burst=1.0):
+        self._base_rate = float(rate)
         self._rate = float(rate)
-        self._tokens = float(rate)   # start full
+        self._tokens = max_burst      # start with small burst to avoid initial spike
+        self._max_burst = max_burst
         self._last_refill = time.monotonic()
         self._lock = threading.Lock()
+        self._throttle_count = 0
 
     def acquire(self):
         """Block until a token is available, then consume one."""
@@ -190,7 +194,7 @@ class TokenBucketRateLimiter:
             with self._lock:
                 now = time.monotonic()
                 elapsed = now - self._last_refill
-                self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+                self._tokens = min(self._max_burst, self._tokens + elapsed * self._rate)
                 self._last_refill = now
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
@@ -198,10 +202,30 @@ class TokenBucketRateLimiter:
                 wait = (1.0 - self._tokens) / self._rate
             time.sleep(wait)
 
+    def throttle(self):
+        """Reduce rate after a 429. Cuts rate by 40% each time, minimum 5 req/s."""
+        with self._lock:
+            self._throttle_count += 1
+            self._rate = max(5.0, self._rate * 0.6)
+            self._tokens = 0  # drain bucket to enforce immediate slowdown
+
+    def recover(self):
+        """Gradually recover rate toward base after successful requests."""
+        with self._lock:
+            if self._rate < self._base_rate:
+                self._rate = min(self._base_rate, self._rate * 1.1)
+                if self._rate >= self._base_rate * 0.95:
+                    self._rate = self._base_rate
+
+    @property
+    def current_rate(self):
+        return self._rate
+
     def set_rate(self, new_rate):
         with self._lock:
+            self._base_rate = float(new_rate)
             self._rate = float(new_rate)
-            self._tokens = min(self._tokens, float(new_rate))
+            self._tokens = min(self._tokens, self._max_burst)
 
 
 class _SacToken:
@@ -789,11 +813,14 @@ class TeamsEnumerator:
         test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
         if self.teams_apim_manager:
             gw = self.teams_apim_manager.get_next_url()
+            if not gw.endswith("/"):
+                gw += "/"
             url = f"{gw}{self.region}/beta/users/{test_email}/externalsearchv3"
         else:
             url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{test_email}/externalsearchv3"
 
         headers = self._build_headers_for_token(entry)
+        entry.rate_limiter.acquire()
         try:
             resp = self._session.get(url, headers=headers, timeout=10, verify=True)
             if resp.status_code == 200:
@@ -903,6 +930,8 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 429:
+                # Adaptive backoff: reduce the rate limiter so future requests slow down
+                token_entry.rate_limiter.throttle()
                 # Put this token in cooldown; next attempt will pick a different one
                 retry_after = min(int(resp.headers.get("Retry-After", 10)), 60)
                 token_entry.set_cooldown(retry_after)
@@ -913,6 +942,7 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 200:
+                token_entry.rate_limiter.recover()
                 body = resp.text
                 if "tenantId" in body:
                     try:
