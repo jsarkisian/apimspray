@@ -221,6 +221,116 @@ def main():
     print("-" * 40)
 
 
+def generate_bicep(login_instances, teams_instances, timestamp, login_prefix, teams_prefix):
+    """Generate a Bicep template with all APIM instances and their child resources."""
+    lines = []
+
+    # Login instances
+    for inst in login_instances:
+        idx = inst["index"]
+        region = inst["region"]
+        name = f"apimspray-{timestamp}-{idx}"
+        _emit_instance(lines, name, region, login_prefix,
+                       backend_url="https://login.microsoftonline.com",
+                       api_id="oauth", api_display="OAuth",
+                       product_id="apimspray-product", product_name="apimspray",
+                       operations=[{"id": "logon", "method": "POST",
+                                    "url_template": "/common/oauth2/token",
+                                    "display_name": "logon"}],
+                       output_prefix="login")
+
+    # Teams instances
+    for inst in teams_instances:
+        idx = inst["index"]
+        region = inst["region"]
+        name = f"apimteams-{timestamp}-{idx}"
+        _emit_instance(lines, name, region, teams_prefix,
+                       backend_url="https://teams.microsoft.com/api/mt",
+                       api_id="teamsapi", api_display="TeamsAPI",
+                       product_id="apimteams-product", product_name="apimteams",
+                       operations=[{"id": "enumuser", "method": "GET",
+                                    "url_template": "/*",
+                                    "display_name": "Teams User Enum"}],
+                       output_prefix="teams")
+
+    return "\n".join(lines)
+
+
+def _emit_instance(lines, name, region, prefix, backend_url, api_id, api_display,
+                   product_id, product_name, operations, output_prefix):
+    """Emit Bicep resource blocks for a single APIM instance + children."""
+    # Bicep resource names must be valid identifiers — replace hyphens
+    res_id = name.replace("-", "_")
+
+    lines.append(f"resource {res_id} 'Microsoft.ApiManagement/service@2022-08-01' = {{")
+    lines.append(f"  name: '{name}'")
+    lines.append(f"  location: '{region}'")
+    lines.append(f"  sku: {{")
+    lines.append(f"    name: 'Consumption'")
+    lines.append(f"    capacity: 0")
+    lines.append(f"  }}")
+    lines.append(f"  properties: {{")
+    lines.append(f"    publisherEmail: 'proxy@example.com'")
+    lines.append(f"    publisherName: 'Proxy'")
+    lines.append(f"  }}")
+    lines.append(f"}}")
+    lines.append("")
+
+    # API
+    api_res = f"{res_id}_api"
+    lines.append(f"resource {api_res} 'Microsoft.ApiManagement/service/apis@2022-08-01' = {{")
+    lines.append(f"  parent: {res_id}")
+    lines.append(f"  name: '{api_id}'")
+    lines.append(f"  properties: {{")
+    lines.append(f"    displayName: '{api_display}'")
+    lines.append(f"    path: '{prefix}'")
+    lines.append(f"    protocols: ['https']")
+    lines.append(f"    serviceUrl: '{backend_url}'")
+    lines.append(f"    apiType: 'http'")
+    lines.append(f"  }}")
+    lines.append(f"}}")
+    lines.append("")
+
+    # Operations
+    for op in operations:
+        op_res = f"{res_id}_op_{op['id']}"
+        lines.append(f"resource {op_res} 'Microsoft.ApiManagement/service/apis/operations@2022-08-01' = {{")
+        lines.append(f"  parent: {api_res}")
+        lines.append(f"  name: '{op['id']}'")
+        lines.append(f"  properties: {{")
+        lines.append(f"    displayName: '{op['display_name']}'")
+        lines.append(f"    method: '{op['method']}'")
+        lines.append(f"    urlTemplate: '{op['url_template']}'")
+        lines.append(f"  }}")
+        lines.append(f"}}")
+        lines.append("")
+
+    # Product
+    prod_res = f"{res_id}_product"
+    lines.append(f"resource {prod_res} 'Microsoft.ApiManagement/service/products@2022-08-01' = {{")
+    lines.append(f"  parent: {res_id}")
+    lines.append(f"  name: '{product_id}'")
+    lines.append(f"  properties: {{")
+    lines.append(f"    displayName: '{product_name}'")
+    lines.append(f"    subscriptionRequired: false")
+    lines.append(f"    state: 'published'")
+    lines.append(f"  }}")
+    lines.append(f"}}")
+    lines.append("")
+
+    # Product-API link
+    link_res = f"{res_id}_prodapi"
+    lines.append(f"resource {link_res} 'Microsoft.ApiManagement/service/products/apis@2022-08-01' = {{")
+    lines.append(f"  parent: {prod_res}")
+    lines.append(f"  name: '{api_id}'")
+    lines.append(f"}}")
+    lines.append("")
+
+    # Output
+    lines.append(f"output {res_id}_url string = '${{{res_id}.properties.gatewayUrl}}/{prefix}/'")
+    lines.append("")
+
+
 def _delete_old_groups():
     log("info", "Checking for old resource groups...")
     deleted = 0
