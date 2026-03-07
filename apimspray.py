@@ -53,12 +53,12 @@ PACE_SETTINGS = {
 # Actual request rate is controlled by TokenBucketRateLimiter inside enumerate_user,
 # not by submission delay. Workers control HTTP concurrency only.
 # Add more sacrificial accounts (--sac-accounts) to scale throughput linearly.
-TEAMS_ENUM_RATE_PER_TOKEN = 40.0  # req/s per token; adaptive backoff adjusts down on 429s
+TEAMS_ENUM_RATE_PER_TOKEN = 15.0  # req/s per token; Teams search API throttles above ~20/s
 
 ENUM_PACE_SETTINGS = {
-    "high":    {"workers": 60, "delay": 0, "jitter": 0},
-    "medium":  {"workers": 30, "delay": 0, "jitter": 0},
-    "mid":     {"workers": 30, "delay": 0, "jitter": 0},
+    "high":    {"workers": 30, "delay": 0, "jitter": 0},
+    "medium":  {"workers": 20, "delay": 0, "jitter": 0},
+    "mid":     {"workers": 20, "delay": 0, "jitter": 0},
     "low":     {"workers": 15, "delay": 0, "jitter": 0},
     "stealth": {"workers": 5,  "delay": 0.5, "jitter": 20},
 }
@@ -886,10 +886,11 @@ class TeamsEnumerator:
                 result["error"] = "No tokens in pool"
                 return result
 
-            # Wait out any remaining cooldown on this token (capped to avoid stalling)
-            cd = token_entry.cooldown_remaining
-            if cd > 0:
-                time.sleep(min(cd, 15))
+            # If this token is in cooldown, don't block — return error so the
+            # user goes to the retry queue instead of stalling all workers.
+            if token_entry.cooldown_remaining > 0:
+                result["error"] = "all tokens in cooldown"
+                return result
 
             # Acquire a rate-limit slot — blocks until the per-token budget allows
             token_entry.rate_limiter.acquire()
@@ -931,14 +932,11 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 429:
-                # Put this token in cooldown; next attempt will pick a different one.
-                # Don't reduce the rate — the fixed rate limiter already controls
-                # throughput, and the cooldown is sufficient to let the API recover.
+                # Put this token in cooldown and return immediately — don't block
+                # this worker thread. The user goes to retry queue and will be
+                # re-checked in the next pass when tokens are out of cooldown.
                 retry_after = min(int(resp.headers.get("Retry-After", 10)), 60)
                 token_entry.set_cooldown(retry_after)
-                if attempt < max_retries:
-                    time.sleep(min(retry_after, 5))
-                    continue
                 result["error"] = "HTTP 429 -- rate limited"
                 return result
 
