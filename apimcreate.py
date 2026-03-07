@@ -186,7 +186,6 @@ def main():
             f"--resource-group {resource_group} "
             f"--template-file {bicep_path} "
             f"--name apimcreate-{timestamp} "
-            f"--no-wait false"
         )
         log("ok", "Deployment complete")
     except subprocess.CalledProcessError as e:
