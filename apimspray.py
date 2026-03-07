@@ -1645,11 +1645,7 @@ def _run_enumerate(args):
         print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
 
     effective_rate = token_count * TEAMS_ENUM_RATE_PER_TOKEN
-    # Scale workers to token count — too many workers per token causes bursts and 429s
-    # ~5 workers per token is enough to keep the rate limiter fed without contention
-    workers = min(workers, max(5, token_count * 5))
     print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
-    print_info(f"Workers adjusted to {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)} (based on token count)")
 
     if not args.skip_sanity:
         sample_domain = users[0].split("@")[1] if "@" in users[0] else args.domain
