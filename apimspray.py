@@ -879,6 +879,24 @@ class TeamsEnumerator:
                 return result
 
             if resp.status_code == 401:
+                # Log the response to help diagnose whether this is Teams or APIM rejecting us
+                resp_snippet = resp.text[:300] if resp.text else "(empty body)"
+                # Check if APIM itself is rejecting (e.g. missing subscription key)
+                is_apim_error = "Access denied" in resp_snippet or "subscription" in resp_snippet.lower()
+                if is_apim_error:
+                    result["error"] = f"HTTP 401 from APIM gateway -- {resp_snippet}"
+                    # Don't mark as token_expired — this is a gateway config issue, not a token issue
+                    if attempt < max_retries:
+                        continue
+                    return result
+                # Log once per token to avoid spam — use a set on the enumerator
+                logged_set = getattr(self, "_401_logged", set())
+                tok_id = token_entry.bearer[:16]
+                if tok_id not in logged_set:
+                    logged_set.add(tok_id)
+                    self._401_logged = logged_set
+                    print_warn(f"HTTP 401 from {gw_host} | skype={'yes' if token_entry.skype else 'NO'} | "
+                               f"url={enum_url[:120]} | resp={resp_snippet[:200]}")
                 result["error"] = "HTTP 401 -- token expired"
                 result["token_expired"] = True
                 result["expired_bearer"] = token_entry.bearer
