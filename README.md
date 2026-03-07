@@ -91,6 +91,50 @@ options:
   --delete-old          Delete old resource groups
 ```
 
+### Deploy with apimcreate.py (Recommended)
+
+Deploys all APIM instances in a single Bicep deployment for maximum speed. Replaces the per-instance sequential CLI calls with one atomic ARM deployment.
+
+```bash
+# Deploy 33 login gateways
+python3 apimcreate.py --type login --count 33 --outfile urls.txt
+
+# Deploy 10 Teams gateways
+python3 apimcreate.py --type teams --count 10 --outfile teams_urls.txt
+
+# Deploy both login and Teams gateways in one deployment
+python3 apimcreate.py --type both --count 33 --outfile urls.txt --teams-outfile teams_urls.txt
+
+# Deploy into specific regions
+python3 apimcreate.py --type login --location germanywestcentral,westeurope --count 33 --outfile urls.txt
+
+# Clean up old deployments
+python3 apimcreate.py --type login --delete-only
+```
+
+**apimcreate CLI reference:**
+
+```text
+usage: apimcreate.py [-h] --type {login,teams,both} [--count COUNT] [--outfile OUTFILE]
+                     [--teams-outfile TEAMS_OUTFILE] [--location LOCATION] [--prefix PREFIX]
+                     [--delete-old] [--delete-only]
+
+apimcreate - Unified Azure APIM Deployer (Bicep)
+
+options:
+  -h, --help            show this help message and exit
+  --type {login,teams,both}
+                        Type of APIM gateways to deploy
+  --count COUNT         Number of instances per type
+  --outfile OUTFILE     Output file for login gateway URLs
+  --teams-outfile TEAMS_OUTFILE
+                        Output file for Teams gateway URLs (required with --type both)
+  --location LOCATION   Comma-separated APIM location(s)
+  --prefix PREFIX       API URL prefix (default: oauth for login, teamsmt for teams)
+  --delete-old          Delete old resource groups before deploying
+  --delete-only         Only delete old resource groups
+```
+
 **Important:** For all methods, you must have an active `az` session in the background (`az login`).
 
 ### 2. Prepare Wordlists
