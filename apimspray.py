@@ -1173,7 +1173,7 @@ def main():
         description="apimspray - Entra ID Assessment Tool (with Teams Enumeration)",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--urls", required=False, help="Path to APIM URLs file (login gateways, from apimspraycreate.py)")
+    parser.add_argument("--urls", required=False, help="Path to APIM URLs file (login gateways, from apimcreate.py)")
     parser.add_argument("--teams-urls", required=False, help=(
         "Path to Teams APIM URLs file (teams gateways, from apimspraycreate_teams.py).\n"
         "If not provided in enumerate mode, Teams API calls go direct (no IP rotation for enum)."
@@ -1247,10 +1247,10 @@ def main():
             try:
                 choice = input("Would you like to deploy new APIM resources now? [y/N]: ").strip().lower()
                 if choice in ('y', 'yes'):
-                    print_info("Launching apimspraycreate.py...")
+                    print_info("Launching apimcreate.py...")
                     try:
                         subprocess.run(
-                            [sys.executable, "apimspraycreate.py", "--count", "33", "--outfile", "urls.txt"],
+                            [sys.executable, "apimcreate.py", "--type", "login", "--count", "33", "--outfile", "urls.txt"],
                             check=True
                         )
                         args.urls = "urls.txt"
