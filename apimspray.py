@@ -580,6 +580,7 @@ class TeamsEnumerator:
         self._token_pool = []          # list[_SacToken]
         self._pool_lock = threading.Lock()
         self._pool_idx = 0
+        self._pending_bearer = None
         # Shared session with large connection pool for TCP reuse
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=50,
@@ -598,16 +599,19 @@ class TeamsEnumerator:
         with self._pool_lock:
             if not self._token_pool:
                 return None
-            if len(self._token_pool) == 1:
-                return self._token_pool[0]
-            for _ in range(len(self._token_pool)):
-                idx = self._pool_idx % len(self._token_pool)
+            ready = [e for e in self._token_pool if e.skype]
+            if not ready:
+                return None
+            if len(ready) == 1:
+                return ready[0]
+            for _ in range(len(ready)):
+                idx = self._pool_idx % len(ready)
                 self._pool_idx += 1
-                entry = self._token_pool[idx]
+                entry = ready[idx]
                 if entry.cooldown_remaining == 0:
                     return entry
             # All cooling down — return the one with least wait
-            return min(self._token_pool, key=lambda e: e.cooldown_remaining)
+            return min(ready, key=lambda e: e.cooldown_remaining)
 
     def _build_headers_for_token(self, token_entry):
         """Build Teams API headers scoped to a specific sacrificial token."""
@@ -682,10 +686,12 @@ class TeamsEnumerator:
                 if "access_token" in token_data:
                     self.bearer_token = token_data["access_token"]
                     print_success("Sacrificial account authenticated via APIM -- Teams bearer token acquired")
-                    # Upsert into the token pool (replace existing entry for this username on re-auth)
+                    # Remove old entry now; new entry is added by acquire_skype_token()
+                    # once both bearer + skype are ready (avoids race where threads
+                    # pick up an entry with skype=None and get 401).
                     with self._pool_lock:
                         self._token_pool = [e for e in self._token_pool if e.username != username]
-                        self._token_pool.append(_SacToken(self.bearer_token, None, username, password))
+                    self._pending_bearer = (self.bearer_token, username, password)
                     return True
                 else:
                     print_error(f"Auth response missing access_token: {resp.text[:200]}")
@@ -722,12 +728,22 @@ class TeamsEnumerator:
                 skype_token = data.get("tokens", {}).get("skypeToken")
                 if skype_token:
                     self.skype_token = skype_token
-                    # Update the matching pool entry with the skype token
+                    # Add the fully-ready token to the pool (bearer + skype).
+                    # authenticate_sacrificial() removed the old entry and stashed
+                    # the pending bearer — now we insert the complete entry atomically.
+                    pending = getattr(self, "_pending_bearer", None)
                     with self._pool_lock:
-                        for entry in self._token_pool:
-                            if entry.bearer == self.bearer_token:
-                                entry.skype = skype_token
-                                break
+                        if pending and pending[0] == self.bearer_token:
+                            self._token_pool.append(
+                                _SacToken(self.bearer_token, skype_token, pending[1], pending[2])
+                            )
+                            self._pending_bearer = None
+                        else:
+                            # Fallback: update existing entry in-place
+                            for entry in self._token_pool:
+                                if entry.bearer == self.bearer_token:
+                                    entry.skype = skype_token
+                                    break
                     region_hint = data.get("region", "").lower()
                     if region_hint in TEAMS_REGIONS:
                         self.region = region_hint
