@@ -765,6 +765,58 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
+    def verify_token(self, username=None):
+        """
+        Make a lightweight Teams API call to verify the token actually works.
+        Uses the /v1/users/ME/properties endpoint which requires a valid skype token
+        but doesn't hit the search API.
+        Returns True if the token is functional, False otherwise with diagnostic info.
+        """
+        # Find the token entry to test
+        with self._pool_lock:
+            if username:
+                entry = next((e for e in self._token_pool if e.username == username), None)
+            else:
+                entry = self._token_pool[0] if self._token_pool else None
+        if not entry:
+            print_error("No token entry found to verify")
+            return False
+        if not entry.skype:
+            print_error(f"Token for {entry.username} has no Skype token")
+            return False
+
+        # Test with a simple search for a nonsense user (won't find anyone)
+        test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
+        if self.teams_apim_manager:
+            gw = self.teams_apim_manager.get_next_url()
+            url = f"{gw}{self.region}/beta/users/{test_email}/externalsearchv3"
+        else:
+            url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{test_email}/externalsearchv3"
+
+        headers = self._build_headers_for_token(entry)
+        try:
+            resp = self._session.get(url, headers=headers, timeout=10, verify=True)
+            if resp.status_code == 200:
+                print_success(f"Token verified for {entry.username} (HTTP 200)")
+                return True
+            elif resp.status_code == 401:
+                print_error(f"Token REJECTED for {entry.username} (HTTP 401) — account may lack a Teams license or the Skype token is invalid")
+                print_error(f"  Bearer: {entry.bearer[:20]}...  Skype: {entry.skype[:20]}...")
+                return False
+            elif resp.status_code == 403:
+                print_error(f"Token FORBIDDEN for {entry.username} (HTTP 403) — account may be restricted from Teams external search")
+                return False
+            elif resp.status_code == 429:
+                print_warn(f"Token got rate-limited during verification (HTTP 429) — token likely valid, proceeding")
+                return True
+            else:
+                print_warn(f"Token verification got HTTP {resp.status_code} for {entry.username} — proceeding cautiously")
+                print_warn(f"  Response: {resp.text[:200]}")
+                return True
+        except requests.RequestException as e:
+            print_error(f"Token verification request failed: {e}")
+            return False
+
     def enumerate_user(self, email, fetch_presence=False, max_retries=2):
         """
         Check if a user exists via the Teams externalsearchv3 endpoint.
@@ -1114,23 +1166,44 @@ def process_enum_attempt(
                         break
 
             if expired_entry and expired_entry.bearer == expired_bearer:
-                print_warn(f"Token expired for {expired_entry.username} — re-authenticating...")
-                ok = teams_enumerator.authenticate_sacrificial(
-                    expired_entry.username,
-                    expired_entry.password,
-                    teams_enumerator._tenant,
-                )
-                if ok:
-                    teams_enumerator.acquire_skype_token()
-                else:
+                # Circuit breaker: if we already re-authed recently and the fresh
+                # token also got 401, the account is fundamentally broken — don't loop.
+                reauth_fails = getattr(teams_enumerator, "_reauth_401_count", 0)
+                if reauth_fails >= 3:
+                    print_error(f"Token for {expired_entry.username} has failed {reauth_fails} consecutive re-auths — "
+                                "account likely lacks Teams license or permissions. Removing from pool.")
                     with teams_enumerator._pool_lock:
+                        teams_enumerator._token_pool = [e for e in teams_enumerator._token_pool if e.username != expired_entry.username]
                         remaining = len(teams_enumerator._token_pool)
-                    if remaining <= 1:
-                        print_error("Re-authentication failed and no backup tokens — stopping enumeration")
+                    if remaining == 0:
+                        print_error("No working tokens remain — stopping enumeration")
                         stop_event.set()
                         return
+                    print_warn(f"{remaining} token(s) remain in pool")
+                else:
+                    print_warn(f"Token expired for {expired_entry.username} — re-authenticating...")
+                    ok = teams_enumerator.authenticate_sacrificial(
+                        expired_entry.username,
+                        expired_entry.password,
+                        teams_enumerator._tenant,
+                    )
+                    if ok:
+                        skype_ok = teams_enumerator.acquire_skype_token()
+                        if skype_ok and not teams_enumerator.verify_token(expired_entry.username):
+                            teams_enumerator._reauth_401_count = reauth_fails + 1
+                            print_error(f"Fresh token for {expired_entry.username} immediately rejected by Teams API "
+                                        f"(attempt {reauth_fails + 1}/3)")
+                        elif skype_ok:
+                            teams_enumerator._reauth_401_count = 0  # Reset on success
                     else:
-                        print_warn(f"Re-auth failed for {expired_entry.username} — continuing with remaining tokens")
+                        with teams_enumerator._pool_lock:
+                            remaining = len(teams_enumerator._token_pool)
+                        if remaining == 0:
+                            print_error("Re-authentication failed and no backup tokens — stopping enumeration")
+                            stop_event.set()
+                            return
+                        else:
+                            print_warn(f"Re-auth failed for {expired_entry.username} — continuing with remaining tokens")
 
         # Retry with refreshed token
         result = teams_enumerator.enumerate_user(email, fetch_presence=False)
@@ -1506,6 +1579,22 @@ def _run_enumerate(args):
     if token_count == 0:
         print_error("No sacrificial accounts authenticated successfully.")
         sys.exit(1)
+
+    # Verify each token actually works against the Teams search API
+    print_info("Verifying token(s) against Teams API...")
+    failed_usernames = []
+    for entry in list(enumerator._token_pool):
+        if not enumerator.verify_token(entry.username):
+            failed_usernames.append(entry.username)
+    if failed_usernames:
+        with enumerator._pool_lock:
+            enumerator._token_pool = [e for e in enumerator._token_pool if e.username not in failed_usernames]
+        token_count = len(enumerator._token_pool)
+        if token_count == 0:
+            print_error("All tokens failed verification — check that sacrificial accounts have Teams licenses.")
+            sys.exit(1)
+        print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
+
     effective_rate = token_count * TEAMS_ENUM_RATE_PER_TOKEN
     print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
 
