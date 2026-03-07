@@ -1681,10 +1681,9 @@ def _run_enumerate(args):
         print_info(f"{pass_label}: {style(str(len(current_user_list)), TermColors.MAGENTA, TermColors.BOLD)} users, {style(str(pass_workers), TermColors.MAGENTA, TermColors.BOLD)} workers")
         sys.stdout.flush()
 
-        progress_tracker = ProgressTracker() if args.verbose else None
-        if progress_tracker:
-            progress_tracker.begin_session(len(current_user_list))
-            progress_tracker.begin_round(len(current_user_list), label=pass_label)
+        progress_tracker = ProgressTracker()
+        progress_tracker.begin_session(len(current_user_list))
+        progress_tracker.begin_round(len(current_user_list), label=pass_label)
 
         failed_users_list = []  # thread-safe via lock
 
@@ -1697,8 +1696,7 @@ def _run_enumerate(args):
                 except Exception as e:
                     print_warn(f"Enum worker error: {e}")
                 finally:
-                    if tracker:
-                        tracker.increment()
+                    tracker.increment()
             return _on_done
 
         on_done = _make_on_done(progress_tracker)
@@ -1722,9 +1720,8 @@ def _run_enumerate(args):
                 )
                 future.add_done_callback(on_done)
 
-        if progress_tracker:
-            progress_tracker.end_round()
-            progress_tracker.end_session()
+        progress_tracker.end_round()
+        progress_tracker.end_session()
 
         if not failed_users_list or stop_event.is_set():
             break
