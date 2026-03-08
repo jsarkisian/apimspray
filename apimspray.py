@@ -52,13 +52,13 @@ PACE_SETTINGS = {
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
 # Teams API throttles per token. Each token gets dedicated worker threads with
 # an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
-TEAMS_ENUM_RATE_PER_TOKEN = 10.0  # req/s per token; smooth interval spacing avoids bursts
+TEAMS_ENUM_RATE_PER_TOKEN = 5.0  # req/s per token; conservative default
 
 ENUM_PACE_SETTINGS = {
-    "high":    {"rate": 15, "threads_per_token": 8},
-    "medium":  {"rate": 10, "threads_per_token": 5},
-    "mid":     {"rate": 10, "threads_per_token": 5},
-    "low":     {"rate": 5,  "threads_per_token": 3},
+    "high":    {"rate": 8,  "threads_per_token": 5},
+    "medium":  {"rate": 5,  "threads_per_token": 3},
+    "mid":     {"rate": 5,  "threads_per_token": 3},
+    "low":     {"rate": 3,  "threads_per_token": 2},
     "stealth": {"rate": 1,  "threads_per_token": 1},
 }
 
@@ -206,7 +206,7 @@ class _SacToken:
     IntervalTimer for rate spacing.
     """
     __slots__ = ("bearer", "skype", "username", "password", "timer",
-                 "reauth_lock")
+                 "reauth_lock", "backoff_until")
 
     def __init__(self, bearer, skype, username, password="", rate=None):
         self.bearer = bearer
@@ -215,6 +215,7 @@ class _SacToken:
         self.password = password
         self.timer = IntervalTimer(rate or TEAMS_ENUM_RATE_PER_TOKEN)
         self.reauth_lock = threading.Lock()
+        self.backoff_until = 0.0  # monotonic timestamp; all threads for this token pause until then
 
 
 class TeamsAPIMManager:
@@ -858,6 +859,11 @@ class TeamsEnumerator:
                     user_queue.task_done()
                     return
 
+                # If this token is in backoff (another thread got 429), wait it out
+                bo = token_entry.backoff_until - time.monotonic()
+                if bo > 0:
+                    time.sleep(bo)
+
                 token_entry.timer.wait()
                 result = self._make_enum_request(email, token_entry)
 
@@ -866,14 +872,15 @@ class TeamsEnumerator:
                     reauth_failures = 0
                     break
 
-                # 429 — sleep and retry same user
+                # 429 — pause ALL threads for this token, then retry
                 if "429" in str(result["error"]):
                     retry_after = result.get("retry_after", 10)
+                    token_entry.backoff_until = time.monotonic() + retry_after
                     with counters_lock:
                         counters["rate_limited"] += 1
                         rl = counters["rate_limited"]
                     if rl == 1 or rl % 50 == 0:
-                        print_warn(f"Rate limited (429) x{rl} — backing off {retry_after}s "
+                        print_warn(f"Rate limited (429) x{rl} — all threads backing off {retry_after}s "
                                    f"[{token_entry.username}]")
                         sys.stdout.flush()
                     time.sleep(retry_after)
