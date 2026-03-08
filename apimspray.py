@@ -810,40 +810,46 @@ class TeamsEnumerator:
             print_error(f"Token for {entry.username} has no Skype token")
             return False
 
-        # Test with a simple search for a nonsense user (won't find anyone)
-        test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
-        if self.teams_apim_manager:
-            gw = self.teams_apim_manager.get_next_url()
-            if not gw.endswith("/"):
-                gw += "/"
-            url = f"{gw}{self.region}/beta/users/{test_email}/externalsearchv3"
-        else:
-            url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{test_email}/externalsearchv3"
-
-        headers = self._build_headers_for_token(entry)
-        entry.rate_limiter.acquire()
-        try:
-            resp = self._session.get(url, headers=headers, timeout=10, verify=True)
-            if resp.status_code == 200:
-                print_success(f"Token verified for {entry.username} (HTTP 200)")
-                return True
-            elif resp.status_code == 401:
-                print_error(f"Token REJECTED for {entry.username} (HTTP 401) — account may lack a Teams license or the Skype token is invalid")
-                print_error(f"  Bearer: {entry.bearer[:20]}...  Skype: {entry.skype[:20]}...")
-                return False
-            elif resp.status_code == 403:
-                print_error(f"Token FORBIDDEN for {entry.username} (HTTP 403) — account may be restricted from Teams external search")
-                return False
-            elif resp.status_code == 429:
-                print_warn(f"Token got rate-limited during verification (HTTP 429) — token likely valid, proceeding")
-                return True
+        # Test with a simple search for a nonsense user (won't find anyone).
+        # Retry up to 3 times with different gateways in case one is down.
+        for verify_attempt in range(3):
+            test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
+            if self.teams_apim_manager:
+                gw = self.teams_apim_manager.get_next_url()
+                if not gw.endswith("/"):
+                    gw += "/"
+                url = f"{gw}{self.region}/beta/users/{test_email}/externalsearchv3"
             else:
-                print_warn(f"Token verification got HTTP {resp.status_code} for {entry.username} — proceeding cautiously")
-                print_warn(f"  Response: {resp.text[:200]}")
-                return True
-        except requests.RequestException as e:
-            print_error(f"Token verification request failed: {e}")
-            return False
+                url = f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{test_email}/externalsearchv3"
+
+            headers = self._build_headers_for_token(entry)
+            entry.rate_limiter.acquire()
+            try:
+                resp = self._session.get(url, headers=headers, timeout=10, verify=True)
+                if resp.status_code == 200:
+                    print_success(f"Token verified for {entry.username} (HTTP 200)")
+                    return True
+                elif resp.status_code == 401:
+                    print_error(f"Token REJECTED for {entry.username} (HTTP 401) — account may lack a Teams license or the Skype token is invalid")
+                    print_error(f"  Bearer: {entry.bearer[:20]}...  Skype: {entry.skype[:20]}...")
+                    return False
+                elif resp.status_code == 403:
+                    print_error(f"Token FORBIDDEN for {entry.username} (HTTP 403) — account may be restricted from Teams external search")
+                    return False
+                elif resp.status_code == 429:
+                    print_warn(f"Token got rate-limited during verification (HTTP 429) — token likely valid, proceeding")
+                    return True
+                else:
+                    print_warn(f"Token verification got HTTP {resp.status_code} for {entry.username} — proceeding cautiously")
+                    print_warn(f"  Response: {resp.text[:200]}")
+                    return True
+            except requests.RequestException as e:
+                print_warn(f"Token verification attempt {verify_attempt + 1}/3 failed (gateway issue): {e}")
+                if verify_attempt < 2:
+                    continue
+                print_error(f"Token verification failed after 3 attempts for {entry.username}")
+                return False
+        return False
 
     def enumerate_user(self, email, fetch_presence=False, max_retries=2):
         """
@@ -886,11 +892,12 @@ class TeamsEnumerator:
                 result["error"] = "No tokens in pool"
                 return result
 
-            # If this token is in cooldown, don't block — return error so the
-            # user goes to the retry queue instead of stalling all workers.
-            if token_entry.cooldown_remaining > 0:
-                result["error"] = "all tokens in cooldown"
-                return result
+            # If this token is in cooldown, wait briefly for it to clear.
+            # Stagger the wait with jitter to prevent thundering herd.
+            cd = token_entry.cooldown_remaining
+            if cd > 0:
+                jitter = random.uniform(0.1, 1.0)
+                time.sleep(min(cd + jitter, 10))
 
             # Acquire a rate-limit slot — blocks until the per-token budget allows
             token_entry.rate_limiter.acquire()
