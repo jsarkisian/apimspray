@@ -114,7 +114,7 @@ def deploy(regions, outfile, prefix):
         # Create function app
         run_command(
             f"az functionapp create --name {app_name} "
-            f"--resource-group {rg_name} --location {region} "
+            f"--resource-group {rg_name} "
             f"--storage-account {storage} "
             f"--consumption-plan-location {region} "
             f"--runtime python --runtime-version 3.11 "
