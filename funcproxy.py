@@ -147,11 +147,11 @@ def deploy(regions, outfile, prefix):
                 f"--functions-version 4 --os-type Linux"
             )
 
-            log("info", f"{tag}: Deploying proxy code...")
+            log("info", f"{tag}: Deploying proxy code (remote build)...")
             run_command(
                 f"az functionapp deployment source config-zip "
                 f"--name {app_name} --resource-group {rg_name} "
-                f"--src {zip_path}"
+                f"--src {zip_path} --build-remote true"
             )
 
             url = f"https://{app_name}.azurewebsites.net/api/"
