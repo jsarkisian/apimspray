@@ -123,7 +123,7 @@ def deploy(regions, outfile, prefix):
         # Storage account names: max 24 chars, lowercase alphanumeric only
         storage = storage[:24]
 
-        log("info", f"[{i+1}/{len(regions)}] Deploying {app_name} in {region}...")
+        log("info", f"[{i+1}/{len(regions)}] {region}: Creating storage account...")
 
         # Create storage account
         run_command(
@@ -131,8 +131,10 @@ def deploy(regions, outfile, prefix):
             f"--resource-group {rg_name} --location {region} "
             f"--sku Standard_LRS --kind StorageV2"
         )
+        log("ok", f"[{i+1}/{len(regions)}] {region}: Storage account ready")
 
         # Create function app
+        log("info", f"[{i+1}/{len(regions)}] {region}: Creating function app...")
         run_command(
             f"az functionapp create --name {app_name} "
             f"--resource-group {rg_name} "
@@ -141,8 +143,10 @@ def deploy(regions, outfile, prefix):
             f"--runtime python --runtime-version 3.11 "
             f"--functions-version 4 --os-type Linux"
         )
+        log("ok", f"[{i+1}/{len(regions)}] {region}: Function app created")
 
         # Deploy code via zip
+        log("info", f"[{i+1}/{len(regions)}] {region}: Deploying proxy code...")
         run_command(
             f"az functionapp deployment source config-zip "
             f"--name {app_name} --resource-group {rg_name} "
@@ -152,7 +156,7 @@ def deploy(regions, outfile, prefix):
         # Get the function URL
         url = f"https://{app_name}.azurewebsites.net/api/"
         urls.append(url)
-        log("ok", f"[{i+1}/{len(regions)}] {url}")
+        log("ok", f"[{i+1}/{len(regions)}] {region}: Ready — {url}")
 
     os.unlink(zip_path)
 
