@@ -236,6 +236,8 @@ def main():
                         help="Deploy Function Apps across regions")
     parser.add_argument("--destroy", action="store_true",
                         help="Delete all funcproxy resource groups")
+    parser.add_argument("--delete-old", action="store_true",
+                        help="Delete old funcproxy resource groups before deploying")
     parser.add_argument("--regions", type=str, default=None,
                         help="Comma-separated regions (default: 15 diverse regions)")
     parser.add_argument("--count", type=int, default=None,
@@ -250,6 +252,9 @@ def main():
     if args.destroy:
         destroy()
         return
+
+    if args.delete_old:
+        destroy()
 
     if not args.deploy:
         parser.print_help()
