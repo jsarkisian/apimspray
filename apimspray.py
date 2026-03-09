@@ -52,18 +52,14 @@ PACE_SETTINGS = {
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
 # Teams API throttles per token. Each token gets dedicated worker threads with
 # an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
-TEAMS_ENUM_RATE_PER_TOKEN = 5.0  # initial req/s per token; auto-adjusts on 429
+TEAMS_ENUM_RATE_PER_TOKEN = 20.0  # initial req/s per token with IP diversity
 
-# Rate = starting requests per second per token. The IntervalTimer auto-adjusts:
-# halves on 429, recovers 10% per 30 successes. This finds the optimal rate.
-# threads_per_token = concurrent HTTP requests to overlap APIM latency (~1s).
-# Scale throughput by adding more sacrificial accounts (--sac-accounts).
 ENUM_PACE_SETTINGS = {
-    "high":    {"rate": 10, "threads_per_token": 8},
-    "medium":  {"rate": 5,  "threads_per_token": 5},
-    "mid":     {"rate": 5,  "threads_per_token": 5},
-    "low":     {"rate": 2,  "threads_per_token": 3},
-    "stealth": {"rate": 0.5, "threads_per_token": 1},
+    "high":    {"rate": 30, "threads_per_token": 15},
+    "medium":  {"rate": 20, "threads_per_token": 10},
+    "mid":     {"rate": 20, "threads_per_token": 10},
+    "low":     {"rate": 10, "threads_per_token": 5},
+    "stealth": {"rate": 3,  "threads_per_token": 3},
 }
 
 # Smart Lockout
@@ -179,21 +175,14 @@ class APIMManager:
 class IntervalTimer:
     """
     Ensures requests are spaced at least `interval` seconds apart.
-    Multiple threads share one timer per token. The timer serializes
-    request starts at a fixed rate regardless of thread count or latency.
-
-    Supports adaptive rate: backoff() halves rate on 429,
-    record_success() gradually recovers toward base rate after sustained success.
+    Multiple threads share one timer per token.
     """
-    __slots__ = ("interval", "_base_interval", "_next_slot", "_lock",
-                 "_successes_since_backoff")
+    __slots__ = ("interval", "_next_slot", "_lock")
 
     def __init__(self, rate):
         self.interval = 1.0 / rate
-        self._base_interval = self.interval
         self._next_slot = time.monotonic()
         self._lock = threading.Lock()
-        self._successes_since_backoff = 0
 
     def wait(self):
         """Block until the next rate-limit slot is available."""
@@ -207,21 +196,6 @@ class IntervalTimer:
                 self._next_slot = now + self.interval
         if wait_time > 0:
             time.sleep(wait_time)
-
-    def backoff(self):
-        """Halve the rate on 429. Returns new rate."""
-        with self._lock:
-            self.interval = min(self.interval * 2, 10.0)  # floor: 0.1 req/s
-            self._successes_since_backoff = 0
-            return 1.0 / self.interval
-
-    def record_success(self):
-        """Track success. After 30 consecutive, recover 10% toward base rate."""
-        with self._lock:
-            self._successes_since_backoff += 1
-            if self._successes_since_backoff >= 30 and self.interval > self._base_interval * 1.05:
-                self.interval = max(self._base_interval, self.interval * 0.9)
-                self._successes_since_backoff = 0
 
     @property
     def current_rate(self):
@@ -801,7 +775,7 @@ class TeamsEnumerator:
 
         if resp.status_code == 429:
             result["error"] = "HTTP 429"
-            result["retry_after"] = min(int(resp.headers.get("Retry-After", 10)), 60)
+            result["retry_after"] = int(resp.headers.get("Retry-After", 2))
             return result
 
         if resp.status_code == 200:
@@ -871,9 +845,8 @@ class TeamsEnumerator:
         Dedicated worker thread for a single token. Pulls users from the
         shared queue, makes enumeration requests at the token's rate.
 
-        On 429: halves the timer rate and re-queues the user (no sleeping).
-        On success: records success to gradually recover rate.
-        This finds the optimal rate automatically without wasting time.
+        On 429: sleeps Retry-After seconds then re-queues the user.
+        With IP diversity, 429s are rare and simple retry is sufficient.
         """
         MAX_REQUEUE = 3
         reauth_failures = 0
@@ -899,7 +872,6 @@ class TeamsEnumerator:
             # Success — process result, recover rate
             if result.get("error") is None:
                 reauth_failures = 0
-                token_entry.timer.record_success()
 
                 with counters_lock:
                     counters["completed"] += 1
@@ -931,16 +903,17 @@ class TeamsEnumerator:
                 user_queue.task_done()
                 continue
 
-            # 429 — halve rate, re-queue user, NO SLEEPING
+            # 429 — sleep Retry-After, then re-queue
             if "429" in str(result["error"]):
-                new_rate = token_entry.timer.backoff()
                 with counters_lock:
                     counters["rate_limited"] += 1
                     rl = counters["rate_limited"]
                 if rl == 1 or rl % 25 == 0:
-                    print_warn(f"429 x{rl} — rate→{new_rate:.1f} req/s "
-                               f"[{token_entry.username}]")
+                    print_warn(f"429 x{rl} [{token_entry.username}]")
                     sys.stdout.flush()
+
+                retry_after = result.get("retry_after", 2)
+                time.sleep(retry_after)
 
                 if attempt < MAX_REQUEUE:
                     user_queue.put((email, attempt + 1))
