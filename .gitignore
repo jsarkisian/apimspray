@@ -1,4 +1,5 @@
 *.txt
+*.zip
 results/
 __pycache__/
 GEMINI.md

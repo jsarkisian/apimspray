@@ -775,7 +775,7 @@ class TeamsEnumerator:
 
         if resp.status_code == 429:
             result["error"] = "HTTP 429"
-            result["retry_after"] = int(resp.headers.get("Retry-After", 2))
+            result["retry_after"] = min(int(resp.headers.get("Retry-After", 2)), 30)
             return result
 
         if resp.status_code == 200:

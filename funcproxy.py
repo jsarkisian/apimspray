@@ -39,6 +39,8 @@ def run_command(command, check=True):
         return result.stdout.strip() if result.stdout else ""
     except subprocess.CalledProcessError as e:
         if check:
+            if e.stderr:
+                log("error", e.stderr.strip())
             raise
         return None
 
@@ -59,7 +61,9 @@ def create_zip_package():
     if not os.path.isdir(template_dir):
         die(f"Function template not found at {template_dir}")
 
-    zip_path = tempfile.mktemp(suffix=".zip")
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    zip_path = tmp.name
+    tmp.close()
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(template_dir):
             for f in files:
