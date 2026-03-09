@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import zipfile
@@ -116,49 +117,69 @@ def deploy(regions, outfile, prefix):
     zip_path = create_zip_package()
     log("ok", "Function package created")
 
-    urls = []
-    for i, region in enumerate(regions):
+    # Deploy all regions in parallel
+    results = [None] * len(regions)
+    errors = []
+    lock = threading.Lock()
+    completed = [0]
+
+    def deploy_region(i, region):
         app_name = f"{prefix}{timestamp}-{i}"
         storage = f"fpstor{timestamp}{i}"
-        # Storage account names: max 24 chars, lowercase alphanumeric only
         storage = storage[:24]
+        tag = f"[{i+1}/{len(regions)}] {region}"
 
-        log("info", f"[{i+1}/{len(regions)}] {region}: Creating storage account...")
+        try:
+            log("info", f"{tag}: Creating storage account...")
+            run_command(
+                f"az storage account create --name {storage} "
+                f"--resource-group {rg_name} --location {region} "
+                f"--sku Standard_LRS --kind StorageV2"
+            )
 
-        # Create storage account
-        run_command(
-            f"az storage account create --name {storage} "
-            f"--resource-group {rg_name} --location {region} "
-            f"--sku Standard_LRS --kind StorageV2"
-        )
-        log("ok", f"[{i+1}/{len(regions)}] {region}: Storage account ready")
+            log("info", f"{tag}: Creating function app...")
+            run_command(
+                f"az functionapp create --name {app_name} "
+                f"--resource-group {rg_name} "
+                f"--storage-account {storage} "
+                f"--consumption-plan-location {region} "
+                f"--runtime python --runtime-version 3.11 "
+                f"--functions-version 4 --os-type Linux"
+            )
 
-        # Create function app
-        log("info", f"[{i+1}/{len(regions)}] {region}: Creating function app...")
-        run_command(
-            f"az functionapp create --name {app_name} "
-            f"--resource-group {rg_name} "
-            f"--storage-account {storage} "
-            f"--consumption-plan-location {region} "
-            f"--runtime python --runtime-version 3.11 "
-            f"--functions-version 4 --os-type Linux"
-        )
-        log("ok", f"[{i+1}/{len(regions)}] {region}: Function app created")
+            log("info", f"{tag}: Deploying proxy code...")
+            run_command(
+                f"az functionapp deployment source config-zip "
+                f"--name {app_name} --resource-group {rg_name} "
+                f"--src {zip_path}"
+            )
 
-        # Deploy code via zip
-        log("info", f"[{i+1}/{len(regions)}] {region}: Deploying proxy code...")
-        run_command(
-            f"az functionapp deployment source config-zip "
-            f"--name {app_name} --resource-group {rg_name} "
-            f"--src {zip_path}"
-        )
+            url = f"https://{app_name}.azurewebsites.net/api/"
+            results[i] = url
+            with lock:
+                completed[0] += 1
+                log("ok", f"{tag}: Ready ({completed[0]}/{len(regions)}) — {url}")
+        except Exception as e:
+            with lock:
+                completed[0] += 1
+                errors.append(region)
+                log("error", f"{tag}: Failed ({completed[0]}/{len(regions)}) — {e}")
 
-        # Get the function URL
-        url = f"https://{app_name}.azurewebsites.net/api/"
-        urls.append(url)
-        log("ok", f"[{i+1}/{len(regions)}] {region}: Ready — {url}")
+    log("info", f"Deploying {len(regions)} function apps in parallel...")
+    threads = []
+    for i, region in enumerate(regions):
+        t = threading.Thread(target=deploy_region, args=(i, region))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
 
     os.unlink(zip_path)
+
+    urls = [u for u in results if u is not None]
+    if errors:
+        log("warn", f"{len(errors)} region(s) failed: {', '.join(errors)}")
 
     # Write output file
     if outfile:
