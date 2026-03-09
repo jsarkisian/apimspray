@@ -165,15 +165,18 @@ def deploy(regions, outfile, prefix):
                 errors.append(region)
                 log("error", f"{tag}: Failed ({completed[0]}/{len(regions)}) — {e}")
 
-    log("info", f"Deploying {len(regions)} function apps in parallel...")
-    threads = []
-    for i, region in enumerate(regions):
-        t = threading.Thread(target=deploy_region, args=(i, region))
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
+    # Deploy in batches of 3 to avoid overwhelming Cloud Shell auth tokens
+    BATCH_SIZE = 3
+    log("info", f"Deploying {len(regions)} function apps ({BATCH_SIZE} at a time)...")
+    for batch_start in range(0, len(regions), BATCH_SIZE):
+        batch = list(enumerate(regions))[batch_start:batch_start + BATCH_SIZE]
+        threads = []
+        for i, region in batch:
+            t = threading.Thread(target=deploy_region, args=(i, region))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
     os.unlink(zip_path)
 
