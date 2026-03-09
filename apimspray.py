@@ -52,17 +52,17 @@ PACE_SETTINGS = {
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
 # Teams API throttles per token. Each token gets dedicated worker threads with
 # an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
-TEAMS_ENUM_RATE_PER_TOKEN = 3.0  # req/s per token; conservative default
+TEAMS_ENUM_RATE_PER_TOKEN = 5.0  # initial req/s per token; auto-adjusts on 429
 
-# Rate = max requests per second per token (IntervalTimer enforced).
-# threads_per_token = concurrent HTTP requests to overlap network latency.
-# With APIM (~1s latency), threads should >= rate to sustain throughput.
-# Scale throughput by adding more sacrificial accounts, not by raising rate.
+# Rate = starting requests per second per token. The IntervalTimer auto-adjusts:
+# halves on 429, recovers 10% per 30 successes. This finds the optimal rate.
+# threads_per_token = concurrent HTTP requests to overlap APIM latency (~1s).
+# Scale throughput by adding more sacrificial accounts (--sac-accounts).
 ENUM_PACE_SETTINGS = {
-    "high":    {"rate": 4,  "threads_per_token": 4},
-    "medium":  {"rate": 3,  "threads_per_token": 3},
-    "mid":     {"rate": 3,  "threads_per_token": 3},
-    "low":     {"rate": 1,  "threads_per_token": 2},
+    "high":    {"rate": 10, "threads_per_token": 8},
+    "medium":  {"rate": 5,  "threads_per_token": 5},
+    "mid":     {"rate": 5,  "threads_per_token": 5},
+    "low":     {"rate": 2,  "threads_per_token": 3},
     "stealth": {"rate": 0.5, "threads_per_token": 1},
 }
 
@@ -181,13 +181,19 @@ class IntervalTimer:
     Ensures requests are spaced at least `interval` seconds apart.
     Multiple threads share one timer per token. The timer serializes
     request starts at a fixed rate regardless of thread count or latency.
+
+    Supports adaptive rate: backoff() halves rate on 429,
+    record_success() gradually recovers toward base rate after sustained success.
     """
-    __slots__ = ("interval", "_next_slot", "_lock")
+    __slots__ = ("interval", "_base_interval", "_next_slot", "_lock",
+                 "_successes_since_backoff")
 
     def __init__(self, rate):
         self.interval = 1.0 / rate
+        self._base_interval = self.interval
         self._next_slot = time.monotonic()
         self._lock = threading.Lock()
+        self._successes_since_backoff = 0
 
     def wait(self):
         """Block until the next rate-limit slot is available."""
@@ -201,6 +207,25 @@ class IntervalTimer:
                 self._next_slot = now + self.interval
         if wait_time > 0:
             time.sleep(wait_time)
+
+    def backoff(self):
+        """Halve the rate on 429. Returns new rate."""
+        with self._lock:
+            self.interval = min(self.interval * 2, 10.0)  # floor: 0.1 req/s
+            self._successes_since_backoff = 0
+            return 1.0 / self.interval
+
+    def record_success(self):
+        """Track success. After 30 consecutive, recover 10% toward base rate."""
+        with self._lock:
+            self._successes_since_backoff += 1
+            if self._successes_since_backoff >= 30 and self.interval > self._base_interval * 1.05:
+                self.interval = max(self._base_interval, self.interval * 0.9)
+                self._successes_since_backoff = 0
+
+    @property
+    def current_rate(self):
+        return 1.0 / self.interval
 
 
 class _SacToken:
@@ -844,70 +869,40 @@ class TeamsEnumerator:
                       logger, progress, stop_event):
         """
         Dedicated worker thread for a single token. Pulls users from the
-        shared queue, makes enumeration requests at the token's rate, and
-        handles 429/401 inline.
+        shared queue, makes enumeration requests at the token's rate.
+
+        On 429: halves the timer rate and re-queues the user (no sleeping).
+        On success: records success to gradually recover rate.
+        This finds the optimal rate automatically without wasting time.
         """
-        MAX_ATTEMPTS = 4
+        MAX_REQUEUE = 3
         reauth_failures = 0
 
         while not stop_event.is_set():
             try:
-                email = user_queue.get(timeout=2)
+                item = user_queue.get(timeout=2)
             except queue.Empty:
                 break  # queue drained
 
-            result = None
-            for attempt in range(MAX_ATTEMPTS):
-                if stop_event.is_set():
-                    user_queue.task_done()
-                    return
+            if isinstance(item, tuple):
+                email, attempt = item
+            else:
+                email, attempt = item, 0
 
-                token_entry.timer.wait()
-                result = self._make_enum_request(email, token_entry)
+            if stop_event.is_set():
+                user_queue.task_done()
+                return
 
-                # Success or definitive non-error response
-                if result.get("error") is None:
-                    reauth_failures = 0
-                    break
+            token_entry.timer.wait()
+            result = self._make_enum_request(email, token_entry)
 
-                # 429 — this thread sleeps, others continue normally
-                if "429" in str(result["error"]):
-                    retry_after = result.get("retry_after", 10)
-                    with counters_lock:
-                        counters["rate_limited"] += 1
-                        rl = counters["rate_limited"]
-                    if rl == 1 or rl % 50 == 0:
-                        print_warn(f"Rate limited (429) x{rl} — backing off {retry_after}s "
-                                   f"[{token_entry.username}]")
-                        sys.stdout.flush()
-                    time.sleep(retry_after)
-                    continue
+            # Success — process result, recover rate
+            if result.get("error") is None:
+                reauth_failures = 0
+                token_entry.timer.record_success()
 
-                # 401 — re-auth this token and retry
-                if result.get("token_expired"):
-                    if reauth_failures >= 3:
-                        print_error(f"Token {token_entry.username} failed 3 consecutive "
-                                    "re-auths — thread exiting")
-                        user_queue.task_done()
-                        return
-                    print_warn(f"Token expired for {token_entry.username} — re-authenticating...")
-                    if self._reauth_token(token_entry):
-                        reauth_failures = 0
-                    else:
-                        reauth_failures += 1
-                    continue
-
-                # Connection error / APIM error — wait briefly and retry
-                if attempt < MAX_ATTEMPTS - 1:
-                    time.sleep(1)
-                    continue
-
-            # Process final result
-            with counters_lock:
-                counters["completed"] += 1
-
-            if result and result.get("error") is None:
                 with counters_lock:
+                    counters["completed"] += 1
                     counters["checked"] += 1
 
                 if result["valid"]:
@@ -931,11 +926,58 @@ class TeamsEnumerator:
                         "tenant_id": result.get("tenant_id"),
                         "mri": result.get("mri"),
                     })
+
+                progress.increment()
+                user_queue.task_done()
+                continue
+
+            # 429 — halve rate, re-queue user, NO SLEEPING
+            if "429" in str(result["error"]):
+                new_rate = token_entry.timer.backoff()
+                with counters_lock:
+                    counters["rate_limited"] += 1
+                    rl = counters["rate_limited"]
+                if rl == 1 or rl % 25 == 0:
+                    print_warn(f"429 x{rl} — rate→{new_rate:.1f} req/s "
+                               f"[{token_entry.username}]")
+                    sys.stdout.flush()
+
+                if attempt < MAX_REQUEUE:
+                    user_queue.put((email, attempt + 1))
+                else:
+                    with counters_lock:
+                        counters["completed"] += 1
+                        counters["errors"] += 1
+                    progress.increment()
+                user_queue.task_done()
+                continue
+
+            # 401 — re-auth and re-queue
+            if result.get("token_expired"):
+                if reauth_failures >= 3:
+                    print_error(f"Token {token_entry.username} failed 3 consecutive "
+                                "re-auths — thread exiting")
+                    user_queue.put((email, attempt))
+                    user_queue.task_done()
+                    return
+                stale = token_entry.bearer
+                print_warn(f"Token expired for {token_entry.username} — re-authenticating...")
+                if self._reauth_token(token_entry):
+                    reauth_failures = 0
+                else:
+                    reauth_failures += 1
+                user_queue.put((email, attempt))
+                user_queue.task_done()
+                continue
+
+            # Connection error / APIM error — re-queue
+            if attempt < MAX_REQUEUE:
+                user_queue.put((email, attempt + 1))
             else:
                 with counters_lock:
+                    counters["completed"] += 1
                     counters["errors"] += 1
-
-            progress.increment()
+                progress.increment()
             user_queue.task_done()
 
     def verify_token(self, username=None):
@@ -1573,11 +1615,30 @@ def _run_enumerate(args):
             t.start()
             threads.append(t)
 
-    # Wait for all threads to complete (with Ctrl+C support)
+    # Wait for all threads to complete — auto-print stats every 30s
+    start_time = time.monotonic()
+    last_status = start_time
     try:
-        for t in threads:
-            while t.is_alive():
-                t.join(timeout=1)
+        while any(t.is_alive() for t in threads):
+            time.sleep(1)
+            now = time.monotonic()
+            if now - last_status >= 30:
+                last_status = now
+                elapsed = now - start_time
+                with counters_lock:
+                    done = counters["completed"]
+                    rl = counters["rate_limited"]
+                    errs = counters["errors"]
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = len(users) - done
+                eta = remaining / rate if rate > 0 else 0
+                eta_str = f"{int(eta//60)}m{int(eta%60)}s" if eta < 7200 else f"{eta/3600:.1f}h"
+                rates = " ".join(f"{e.timer.current_rate:.1f}" for e in enumerator._token_pool)
+                print_info(f"[{int(elapsed)}s] {done}/{len(users)} "
+                           f"| {rate:.1f} req/s | ETA: {eta_str} "
+                           f"| 429s: {rl} | errs: {errs} "
+                           f"| rates: [{rates}] req/s")
+                sys.stdout.flush()
     except KeyboardInterrupt:
         print_warn("\nStopping enumeration...")
         stop_event.set()
