@@ -85,6 +85,27 @@ def deploy(regions, outfile, prefix):
     except Exception:
         die("Azure CLI not logged in. Run: az login")
 
+    # Ensure Microsoft.Web provider is registered
+    reg_state = run_command(
+        "az provider show --namespace Microsoft.Web --query registrationState -o tsv",
+        check=False,
+    )
+    if reg_state and reg_state.strip() != "Registered":
+        log("info", "Registering Microsoft.Web resource provider...")
+        run_command("az provider register --namespace Microsoft.Web")
+        for _ in range(30):
+            time.sleep(5)
+            state = run_command(
+                "az provider show --namespace Microsoft.Web --query registrationState -o tsv",
+                check=False,
+            )
+            if state and state.strip() == "Registered":
+                break
+        else:
+            die("Microsoft.Web provider did not register in time. "
+                "Run: az provider register --namespace Microsoft.Web")
+        log("ok", "Microsoft.Web provider registered")
+
     # Create resource group
     log("info", f"Creating Resource Group: {rg_name} in {rg_location}")
     run_command(f"az group create --name {rg_name} --location {rg_location} "
