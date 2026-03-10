@@ -819,7 +819,7 @@ def _run_enumerate(args):
     else:
         print_info("No --aci-urls provided — enumeration going direct (single thread)")
 
-    enumerator = OneDriveEnumerator(proxy_urls)
+    enumerator = OneDriveEnumerator(proxy_urls, debug=args.verbose)
     valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
     _print_enum_summary(logger, valid_users, users, counters)
