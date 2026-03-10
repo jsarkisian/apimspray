@@ -54,8 +54,8 @@ ENUM_PACE_SETTINGS = {
     #            threads/proxy  timeout  direct_threads
     "turbo":  {"threads_per_proxy": 20, "timeout": 30, "direct_threads": 200},
     "high":   {"threads_per_proxy": 10, "timeout": 25, "direct_threads": 100},
-    "medium": {"threads_per_proxy":  5, "timeout": 15, "direct_threads":  50},
-    "low":    {"threads_per_proxy":  2, "timeout": 10, "direct_threads":  20},
+    "medium": {"threads_per_proxy":  5, "timeout": 20, "direct_threads":  50},
+    "low":    {"threads_per_proxy":  2, "timeout": 15, "direct_threads":  20},
     "stealth":{"threads_per_proxy":  1, "timeout": 10, "direct_threads":   5},
 }
 
@@ -630,8 +630,8 @@ def main():
             "Enumeration speed template (overrides --threads and --timeout):\n"
             " - turbo:   20 threads/proxy, 30s timeout  [~1000 threads with 50 proxies]\n"
             " - high:    10 threads/proxy, 25s timeout  [~500 threads with 50 proxies]\n"
-            " - medium:   5 threads/proxy, 15s timeout  [~250 threads with 50 proxies]\n"
-            " - low:      2 threads/proxy, 10s timeout  [~100 threads with 50 proxies]\n"
+            " - medium:   5 threads/proxy, 20s timeout  [~250 threads with 50 proxies]\n"
+            " - low:      2 threads/proxy, 15s timeout  [~100 threads with 50 proxies]\n"
             " - stealth:  1 thread/proxy,  10s timeout  [~ 50 threads with 50 proxies]"
         ),
     )
