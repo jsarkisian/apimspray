@@ -32,7 +32,7 @@ def _make_enumerator():
     return OneDriveEnumerator(proxy_urls=[])
 
 
-def test_check_user_valid(tmp_path):
+def test_check_user_valid():
     """403 response means valid user."""
     enum = _make_enumerator()
     mock_resp = MagicMock()
@@ -42,7 +42,7 @@ def test_check_user_valid(tmp_path):
     assert result == "valid"
 
 
-def test_check_user_not_found(tmp_path):
+def test_check_user_not_found():
     """404 response means user not found."""
     enum = _make_enumerator()
     mock_resp = MagicMock()
@@ -74,3 +74,35 @@ def test_check_user_via_proxy():
         enum._check_user("john@contoso.com", "contoso", proxy_url="http://1.2.3.4:8080/")
     assert captured["url"].startswith("http://1.2.3.4:8080/")
     assert "personal/" in captured["url"]
+
+
+def test_enumerate_with_proxies():
+    """enumerate() distributes work across proxies and returns valid users."""
+    proxy_urls = ["http://1.1.1.1:8080/", "http://2.2.2.2:8080/"]
+    enum = OneDriveEnumerator(proxy_urls=proxy_urls)
+
+    call_count = [0]
+    def fake_check(upn, tenant_name, proxy_url=None):
+        call_count[0] += 1
+        if upn == "alice@contoso.com":
+            return "valid"
+        return "not_found"
+
+    class FakeLogger:
+        def __init__(self):
+            self.logged = []
+        def log_result(self, result_type, value):
+            self.logged.append((result_type, value))
+
+    logger = FakeLogger()
+    users = ["alice@contoso.com", "bob@contoso.com"]
+
+    with patch.object(enum, "_check_user", side_effect=fake_check):
+        valid_users, counters = enum.enumerate(users, "contoso", logger)
+
+    assert "alice@contoso.com" in valid_users
+    assert "bob@contoso.com" not in valid_users
+    assert counters["valid"] == 1
+    assert counters["not_found"] == 1
+    assert counters["completed"] == 2
+    assert ("enumerated", "alice@contoso.com") in logger.logged

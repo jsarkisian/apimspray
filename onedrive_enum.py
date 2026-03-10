@@ -16,7 +16,6 @@ import queue
 import random
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -105,18 +104,20 @@ class OneDriveEnumerator:
                     upn = user_queue.get_nowait()
                 except queue.Empty:
                     break
-                result = self._check_user(upn, tenant_name, proxy_url)
-                with results_lock:
-                    counters["completed"] += 1
-                    if result == "valid":
-                        counters["valid"] += 1
-                        valid_users.add(upn)
-                        logger.log_result("enumerated", upn)
-                    elif result == "not_found":
-                        counters["not_found"] += 1
-                    else:
-                        counters["errors"] += 1
-                user_queue.task_done()
+                try:
+                    result = self._check_user(upn, tenant_name, proxy_url)
+                    with results_lock:
+                        counters["completed"] += 1
+                        if result == "valid":
+                            counters["valid"] += 1
+                            valid_users.add(upn)
+                            logger.log_result("enumerated", upn)
+                        elif result == "not_found":
+                            counters["not_found"] += 1
+                        else:
+                            counters["errors"] += 1
+                finally:
+                    user_queue.task_done()
 
         with ThreadPoolExecutor(max_workers=n_threads) as executor:
             futures = [executor.submit(worker, proxy_pool[i % len(proxy_pool)])
