@@ -46,9 +46,10 @@ class OneDriveEnumerator:
     Falls back to a single direct thread when no proxies are provided.
     """
 
-    def __init__(self, proxy_urls=None, threads=100, debug=False):
+    def __init__(self, proxy_urls=None, threads=100, timeout=5, debug=False):
         self.proxy_urls = list(proxy_urls) if proxy_urls else []
         self.threads = threads
+        self.timeout = timeout
         self.debug = debug
 
     def _check_user(self, upn, tenant_name=None, proxy_url=None):
@@ -64,7 +65,7 @@ class OneDriveEnumerator:
             url = f"https://{tenant_name}-my.sharepoint.com/{path}"
 
         try:
-            resp = requests.get(url, timeout=15, allow_redirects=False)
+            resp = requests.get(url, timeout=self.timeout, allow_redirects=False)
             if resp.status_code in (302, 403):
                 return "valid"
             elif resp.status_code == 404:
