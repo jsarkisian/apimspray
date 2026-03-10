@@ -12,15 +12,22 @@ Response interpretation:
   other          -> unknown / error
 """
 
+import os
 import queue
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+_USE_COLOR = sys.stdout.isatty() and not os.getenv("NO_COLOR")
 
+def _c(text, *codes):
+    if not _USE_COLOR:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
 
 _SAFE_RE = re.compile(r'[.\-]')
 
@@ -72,11 +79,11 @@ class OneDriveEnumerator:
                 return "not_found"
             else:
                 if self.debug:
-                    print(f"[DEBUG] unexpected status {resp.status_code} for {upn} via {proxy_url}")
+                    print(f"{_c('[DEBUG]', '2', '33')} unexpected status {resp.status_code} for {upn} via {proxy_url}")
                 return "error"
         except requests.RequestException as e:
             if self.debug:
-                print(f"[DEBUG] exception for {upn}: {type(e).__name__}: {e}")
+                print(f"{_c('[DEBUG]', '2', '33')} exception for {upn}: {type(e).__name__}: {e}")
             return "error"
 
     def enumerate(self, users, tenant_name=None, logger=None):
@@ -111,8 +118,13 @@ class OneDriveEnumerator:
                 remaining = total - done
                 eta = int(remaining / rate) if rate > 0 else 0
                 eta_str = f"{eta//60}m{eta%60:02d}s" if eta > 0 else "?"
-                print(f"[*] Progress: {done}/{total} | Found: {found} | "
-                      f"{rate:.1f} req/s | ETA: {eta_str}")
+                print(
+                    f"{_c('[*]', '1', '36')} Progress: "
+                    f"{_c(str(done), '1')}/{_c(str(total), '1')} | "
+                    f"Found: {_c(str(found), '1', '32')} | "
+                    f"{_c(f'{rate:.1f} req/s', '35')} | "
+                    f"ETA: {_c(eta_str, '33')}"
+                )
 
         progress_thread = threading.Thread(target=progress_printer, daemon=True)
         progress_thread.start()
@@ -126,13 +138,13 @@ class OneDriveEnumerator:
                 try:
                     result = self._check_user(upn, tenant_name, proxy_url)
                     if self.debug:
-                        print(f"[DEBUG] {upn} -> {result} (proxy: {proxy_url})")
+                        print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {result} (proxy: {proxy_url})")
                     with results_lock:
                         counters["completed"] += 1
                         if result == "valid":
                             counters["valid"] += 1
                             valid_users.add(upn)
-                            print(f"[+] VALID: {upn}")
+                            print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
                             if logger:
                                 logger.log_result("enumerated", upn)
                         elif result == "not_found":
