@@ -596,7 +596,13 @@ def main():
     parser.add_argument(
         "--aci-urls",
         help="Path to ACI proxy URLs file for enumeration (from onedrive_proxy.py).\n"
-             "Each proxy URL gets one dedicated thread. More proxies = higher throughput."
+             "Proxies are shared across all threads for IP rotation."
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=100,
+        help="Number of threads for enumeration (default: 100)"
     )
 
     args = parser.parse_args()
@@ -815,11 +821,11 @@ def _run_enumerate(args):
         print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
     if proxy_urls:
-        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} (one thread per IP)")
+        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)}")
     else:
-        print_info("No --aci-urls provided — enumeration going direct (single thread)")
+        print_info(f"No --aci-urls provided — going direct | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)}")
 
-    enumerator = OneDriveEnumerator(proxy_urls, debug=args.verbose)
+    enumerator = OneDriveEnumerator(proxy_urls, threads=args.threads, debug=args.verbose)
     valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
     _print_enum_summary(logger, valid_users, users, counters)

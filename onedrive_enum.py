@@ -46,8 +46,9 @@ class OneDriveEnumerator:
     Falls back to a single direct thread when no proxies are provided.
     """
 
-    def __init__(self, proxy_urls=None, debug=False):
+    def __init__(self, proxy_urls=None, threads=100, debug=False):
         self.proxy_urls = list(proxy_urls) if proxy_urls else []
+        self.threads = threads
         self.debug = debug
 
     def _check_user(self, upn, tenant_name=None, proxy_url=None):
@@ -79,9 +80,9 @@ class OneDriveEnumerator:
 
     def enumerate(self, users, tenant_name=None, logger=None):
         """
-        Enumerate all users using the proxy pool.
+        Enumerate all users using the thread pool, round-robining across proxies.
 
-        Thread model: one thread per proxy URL, each thread owns its proxy.
+        Thread count is independent of proxy count — many threads share the proxy pool.
         Returns: (valid_users: set, counters: dict)
         """
         user_queue = queue.Queue()
@@ -89,7 +90,7 @@ class OneDriveEnumerator:
             user_queue.put(u)
 
         proxy_pool = self.proxy_urls if self.proxy_urls else [None]
-        n_threads = len(proxy_pool)
+        n_threads = self.threads
 
         valid_users = set()
         results_lock = threading.Lock()
