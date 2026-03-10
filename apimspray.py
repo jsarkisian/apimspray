@@ -47,6 +47,18 @@ PACE_SETTINGS = {
     "stealth": {"workers": 1, "delay": 30, "count": 1, "lockout": 20, "safe": 1, "jitter": 40},
 }
 
+# Enumerate speed templates — threads_per_proxy scales automatically with proxy count.
+# timeout is how long each request waits for a response.
+# direct_threads is used when no --aci-urls are provided.
+ENUM_PACE_SETTINGS = {
+    #            threads/proxy  timeout  direct_threads
+    "turbo":  {"threads_per_proxy": 20, "timeout": 30, "direct_threads": 200},
+    "high":   {"threads_per_proxy": 10, "timeout": 20, "direct_threads": 100},
+    "medium": {"threads_per_proxy":  5, "timeout": 15, "direct_threads":  50},
+    "low":    {"threads_per_proxy":  2, "timeout": 10, "direct_threads":  20},
+    "stealth":{"threads_per_proxy":  1, "timeout": 10, "direct_threads":   5},
+}
+
 
 # Smart Lockout
 LOCKOUT_WAIT_SECONDS = 65
@@ -602,13 +614,26 @@ def main():
         "--threads",
         type=int,
         default=100,
-        help="Number of threads for enumeration (default: 100)"
+        help="Number of threads for enumeration (default: 100). Overridden by --enum-pace."
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=5,
-        help="Request timeout in seconds for enumeration (default: 5)"
+        help="Request timeout in seconds for enumeration (default: 5). Overridden by --enum-pace."
+    )
+    parser.add_argument(
+        "--enum-pace",
+        choices=["turbo", "high", "medium", "low", "stealth"],
+        default=None,
+        help=(
+            "Enumeration speed template (overrides --threads and --timeout):\n"
+            " - turbo:   20 threads/proxy, 30s timeout  [~1000 threads with 50 proxies]\n"
+            " - high:    10 threads/proxy, 20s timeout  [~500 threads with 50 proxies]\n"
+            " - medium:   5 threads/proxy, 15s timeout  [~250 threads with 50 proxies]\n"
+            " - low:      2 threads/proxy, 10s timeout  [~100 threads with 50 proxies]\n"
+            " - stealth:  1 thread/proxy,  10s timeout  [~ 50 threads with 50 proxies]"
+        ),
     )
 
     args = parser.parse_args()
@@ -819,6 +844,19 @@ def _run_enumerate(args):
             print_error(str(e))
             sys.exit(1)
 
+    # Apply --enum-pace template if set (overrides --threads and --timeout)
+    threads = args.threads
+    timeout = args.timeout
+    pace_label = None
+    if getattr(args, "enum_pace", None):
+        ep = ENUM_PACE_SETTINGS[args.enum_pace]
+        timeout = ep["timeout"]
+        if proxy_urls:
+            threads = len(proxy_urls) * ep["threads_per_proxy"]
+        else:
+            threads = ep["direct_threads"]
+        pace_label = args.enum_pace
+
     logger = Logger(args.output)
 
     print_info(f"Starting apimspray")
@@ -826,12 +864,13 @@ def _run_enumerate(args):
     if tenant_name:
         print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
+    pace_str = f" [{style(pace_label, TermColors.CYAN)}]" if pace_label else ""
     if proxy_urls:
-        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(args.timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}")
+        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} | Threads: {style(str(threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}{pace_str}")
     else:
-        print_info(f"No --aci-urls provided — going direct | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(args.timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}")
+        print_info(f"No --aci-urls provided — going direct | Threads: {style(str(threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}{pace_str}")
 
-    enumerator = OneDriveEnumerator(proxy_urls, threads=args.threads, timeout=args.timeout, debug=args.verbose)
+    enumerator = OneDriveEnumerator(proxy_urls, threads=threads, timeout=timeout, debug=args.verbose)
     valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
     _print_enum_summary(logger, valid_users, users, counters)
