@@ -13,7 +13,6 @@ Response interpretation:
 """
 
 import queue
-import random
 import re
 import threading
 import time
@@ -22,13 +21,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 
-# User agents for GET requests
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-]
 
 _SAFE_RE = re.compile(r'[.\-]')
 
@@ -54,8 +46,9 @@ class OneDriveEnumerator:
     Falls back to a single direct thread when no proxies are provided.
     """
 
-    def __init__(self, proxy_urls=None):
+    def __init__(self, proxy_urls=None, debug=False):
         self.proxy_urls = list(proxy_urls) if proxy_urls else []
+        self.debug = debug
 
     def _check_user(self, upn, tenant_name=None, proxy_url=None):
         """
@@ -69,16 +62,19 @@ class OneDriveEnumerator:
         else:
             url = f"https://{tenant_name}-my.sharepoint.com/{path}"
 
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
         try:
-            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-            if resp.status_code == 403:
+            resp = requests.get(url, timeout=15, allow_redirects=False)
+            if resp.status_code in (302, 403):
                 return "valid"
             elif resp.status_code == 404:
                 return "not_found"
             else:
+                if self.debug:
+                    print(f"[DEBUG] unexpected status {resp.status_code} for {upn} via {proxy_url}")
                 return "error"
-        except requests.RequestException:
+        except requests.RequestException as e:
+            if self.debug:
+                print(f"[DEBUG] exception for {upn}: {type(e).__name__}: {e}")
             return "error"
 
     def enumerate(self, users, tenant_name=None, logger=None):
@@ -127,6 +123,8 @@ class OneDriveEnumerator:
                     break
                 try:
                     result = self._check_user(upn, tenant_name, proxy_url)
+                    if self.debug:
+                        print(f"[DEBUG] {upn} -> {result} (proxy: {proxy_url})")
                     with results_lock:
                         counters["completed"] += 1
                         if result == "valid":
