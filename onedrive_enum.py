@@ -79,11 +79,11 @@ class OneDriveEnumerator:
                 return "not_found"
             else:
                 if self.debug:
-                    print(f"{_c('[DEBUG]', '2', '33')} unexpected status {resp.status_code} for {upn} via {proxy_url}")
+                    print(f"{_c('[ERROR]', '1', '31')} unexpected status {_c(str(resp.status_code), '31')} for {upn} via {proxy_url}")
                 return "error"
         except requests.RequestException as e:
             if self.debug:
-                print(f"{_c('[DEBUG]', '2', '33')} exception for {upn}: {type(e).__name__}: {e}")
+                print(f"{_c('[ERROR]', '1', '31')} {upn}: {type(e).__name__}: {_c(str(e), '31')}")
             return "error"
 
     def enumerate(self, users, tenant_name=None, logger=None):
@@ -138,7 +138,8 @@ class OneDriveEnumerator:
                 try:
                     result = self._check_user(upn, tenant_name, proxy_url)
                     if self.debug:
-                        print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {result} (proxy: {proxy_url})")
+                        color = '32' if result == 'valid' else '31' if result == 'error' else '2'
+                        print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
                     with results_lock:
                         counters["completed"] += 1
                         if result == "valid":
