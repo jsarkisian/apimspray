@@ -1,9 +1,11 @@
 from flask import Flask, request, Response
 import requests as req_lib
+import os
 
 app = Flask(__name__)
 
-UPSTREAM = "https://teams.microsoft.com/api/mt"
+TARGET_HOST = os.environ.get("TARGET_HOST", "teams.microsoft.com")
+UPSTREAM = f"https://{TARGET_HOST}"
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -17,6 +19,7 @@ def proxy(path):
             headers=headers,
             data=request.get_data(),
             timeout=30,
+            allow_redirects=True,
         )
     except req_lib.RequestException as e:
         return Response(str(e), status=502)
