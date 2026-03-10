@@ -623,6 +623,12 @@ def main():
         help="Request timeout in seconds for enumeration (default: 5). Overridden by --enum-pace."
     )
     parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of times to retry errored users at the end of enumeration (default: 1)"
+    )
+    parser.add_argument(
         "--enum-pace",
         choices=["turbo", "high", "medium", "low", "stealth"],
         default=None,
@@ -870,7 +876,7 @@ def _run_enumerate(args):
     else:
         print_info(f"No --aci-urls provided — going direct | Threads: {style(str(threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}{pace_str}")
 
-    enumerator = OneDriveEnumerator(proxy_urls, threads=threads, timeout=timeout, debug=args.verbose)
+    enumerator = OneDriveEnumerator(proxy_urls, threads=threads, timeout=timeout, retries=args.retries, debug=args.verbose)
     valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
     _print_enum_summary(logger, valid_users, users, counters)
