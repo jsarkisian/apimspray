@@ -82,7 +82,7 @@ def test_enumerate_with_proxies():
     enum = OneDriveEnumerator(proxy_urls=proxy_urls)
 
     call_count = [0]
-    def fake_check(upn, tenant_name, proxy_url=None):
+    def fake_check(upn, tenant_name, proxy_url=None, session=None):
         call_count[0] += 1
         if upn == "alice@contoso.com":
             return "valid"
