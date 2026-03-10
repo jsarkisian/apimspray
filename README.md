@@ -126,6 +126,7 @@ Thread count scales automatically with proxy count. Timeout is fixed per templat
 ```bash
 python3 apimspray.py --mode enumerate --users users.txt --aci-urls enum_urls.txt --enum-pace turbo
 ```
+If you notice weird behavior during enumeration, run enumeration with the --verbose flag and see if you are getting timeouts. If so, lower your pace. The tool will also retry the user guesses that timed out.
 
 ### Enumeration Options
 
