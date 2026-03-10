@@ -50,7 +50,10 @@ def run_command(command, check=True):
         return None
 
 
-DEFAULT_REGIONS = ["eastus"]
+DEFAULT_REGIONS = [
+    "eastus", "eastus2", "westus", "westus2", "westus3",
+    "centralus", "northcentralus", "southcentralus", "westcentralus",
+]
 RG_PREFIX = "odproxy-"
 ACR_PREFIX = "odproxyreg"
 
@@ -190,12 +193,15 @@ def deploy(tenant, domain, regions, count, outfile):
                 f"--registry-username {acr_user} "
                 f"--registry-password '{acr_pass}' "
                 f"--environment-variables TARGET_HOST={sharepoint_host} "
-                f"--restart-policy Never"
+                f"--restart-policy Never",
+                check=False
             )
+            # Always check for IP — az container create can return non-zero even on success
             ip = run_command(
                 f"az container show --resource-group {rg_name} "
                 f"--name {container_name} "
-                f"--query ipAddress.ip -o tsv"
+                f"--query ipAddress.ip -o tsv",
+                check=False
             )
             if ip and ip.strip():
                 url = f"http://{ip.strip()}:8080/"
@@ -207,7 +213,7 @@ def deploy(tenant, domain, regions, count, outfile):
                 with lock:
                     completed[0] += 1
                     errors.append(container_name)
-                    log("error", f"{tag}: No IP assigned ({completed[0]}/{count})")
+                    log("error", f"{tag}: No IP assigned — quota likely exceeded in {region} ({completed[0]}/{count})")
         except Exception as e:
             with lock:
                 completed[0] += 1
