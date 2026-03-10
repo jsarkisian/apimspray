@@ -608,7 +608,7 @@ def main():
         ),
     )
     parser.add_argument("--continue-on-success", action="store_true", help="Continue after finding valid credentials.")
-    parser.add_argument("--skip-disabled", action="store_true", help="Remove disabled accounts (AADSTS50057) from the spray list as they are discovered.")
+    parser.add_argument("--remove-disabled", action="store_true", help="Remove disabled accounts (AADSTS50057) from the spray list as they are discovered.")
     parser.add_argument("--randomize-users", action="store_true", help="Randomize user order before each round.")
     parser.add_argument("--verbose", action="store_true", help="Enable on-demand progress output (press Enter to see progress).")
 
@@ -759,7 +759,7 @@ def main():
                 future = executor.submit(
                     process_attempt, target, apim_manager, args.tenant or "common", pace_config,
                     logger, locked_users_set, invalid_users_set, disabled_users_set, lockout_counts,
-                    lock, args.continue_on_success, args.skip_disabled, stop_event,
+                    lock, args.continue_on_success, args.remove_disabled, stop_event,
                 )
                 futures.append(future)
             for f in as_completed(futures):
