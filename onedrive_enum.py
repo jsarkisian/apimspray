@@ -56,7 +56,7 @@ class OneDriveEnumerator:
     def __init__(self, proxy_urls=None):
         self.proxy_urls = list(proxy_urls) if proxy_urls else []
 
-    def _check_user(self, upn, tenant_name, proxy_url=None):
+    def _check_user(self, upn, tenant_name=None, proxy_url=None):
         """
         Make a single OneDrive check for a UPN.
 
@@ -80,7 +80,7 @@ class OneDriveEnumerator:
         except requests.RequestException:
             return "error"
 
-    def enumerate(self, users, tenant_name, logger):
+    def enumerate(self, users, tenant_name=None, logger=None):
         """
         Enumerate all users using the proxy pool.
 
