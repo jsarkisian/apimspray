@@ -52,14 +52,18 @@ PACE_SETTINGS = {
 # Enumerate pacing (separate from spray — enum is read-only, no lockout risk)
 # Teams API throttles per token. Each token gets dedicated worker threads with
 # an IntervalTimer for fixed-rate spacing. Add more sacrificial accounts to scale.
-TEAMS_ENUM_RATE_PER_TOKEN = 20.0  # initial req/s per token with IP diversity
+TEAMS_ENUM_RATE_PER_TOKEN = 2.0  # base req/s per IP; auto-scaled by proxy count
 
+# rate_per_ip = max req/s to send through each proxy IP
+# Teams tolerates ~2-3 req/s per source IP. Total throughput is computed at
+# runtime: rate_per_ip × num_proxies / num_tokens → per-token rate.
+# threads_per_token scales with rate to overlap HTTP latency.
 ENUM_PACE_SETTINGS = {
-    "high":    {"rate": 30, "threads_per_token": 15},
-    "medium":  {"rate": 20, "threads_per_token": 10},
-    "mid":     {"rate": 20, "threads_per_token": 10},
-    "low":     {"rate": 10, "threads_per_token": 5},
-    "stealth": {"rate": 3,  "threads_per_token": 3},
+    "high":    {"rate_per_ip": 2.5, "threads_per_token_per_ip": 1},
+    "medium":  {"rate_per_ip": 1.5, "threads_per_token_per_ip": 1},
+    "mid":     {"rate_per_ip": 1.5, "threads_per_token_per_ip": 1},
+    "low":     {"rate_per_ip": 0.8, "threads_per_token_per_ip": 1},
+    "stealth": {"rate_per_ip": 0.3, "threads_per_token_per_ip": 1},
 }
 
 # Smart Lockout
@@ -1490,9 +1494,18 @@ def _run_enumerate(args):
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
     print_info(f"Sacrificial Auth: {style('via APIM' if login_apim else 'direct', TermColors.MAGENTA, TermColors.BOLD)}")
     enum_pace = ENUM_PACE_SETTINGS[args.pace]
-    pace_rate = enum_pace["rate"]
+    # Compute rate based on number of proxy IPs and tokens
+    num_proxies = len(teams_apim.urls) if teams_apim else 1
+    num_tokens = len(sac_accounts)  # approximate; actual count known after auth
+    rate_per_ip = enum_pace["rate_per_ip"]
+    pace_rate = max(1.0, (rate_per_ip * num_proxies) / max(num_tokens, 1))
+    threads_per_token = max(1, int(enum_pace["threads_per_token_per_ip"] * num_proxies / max(num_tokens, 1)))
+    # Store computed values for later use
+    enum_pace = {"rate": pace_rate, "threads_per_token": threads_per_token}
+    total_rate = pace_rate * num_tokens
     print_info(f"Pace: {style(args.pace, TermColors.MAGENTA, TermColors.BOLD)}, "
-               f"Rate: {style(f'~{pace_rate} req/s per token', TermColors.MAGENTA, TermColors.BOLD)}")
+               f"Rate: {style(f'~{pace_rate:.1f} req/s per token', TermColors.MAGENTA, TermColors.BOLD)} "
+               f"({num_proxies} proxies × {rate_per_ip} req/s/ip ÷ {num_tokens} tokens = ~{total_rate:.0f} req/s total)")
     if not args.no_presence:
         print_info(f"Presence/OOO Fetch: {style('ENABLED (post-enum pass)', TermColors.GREEN, TermColors.BOLD)}")
     else:
@@ -1530,6 +1543,12 @@ def _run_enumerate(args):
             sys.exit(1)
         print_warn(f"Removed {len(failed_usernames)} broken token(s), {token_count} remain")
 
+    # Recalculate rate with actual token count (some may have failed auth)
+    if token_count != num_tokens:
+        num_proxies_actual = len(teams_apim.urls) if teams_apim else 1
+        pace_rate = max(1.0, (rate_per_ip * num_proxies_actual) / max(token_count, 1))
+        threads_per_token = max(1, int(num_proxies_actual / max(token_count, 1)))
+        enum_pace = {"rate": pace_rate, "threads_per_token": threads_per_token}
     effective_rate = token_count * enum_pace["rate"]
     print_success(f"Token pool ready: {style(str(token_count), TermColors.GREEN, TermColors.BOLD)} token(s) — effective rate ~{effective_rate:.0f} req/s")
 
@@ -1570,7 +1589,7 @@ def _run_enumerate(args):
     valid_mris = {}
     results_lock = threading.Lock()
     stop_event = threading.Event()
-    counters = {"completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
+    counters = {"submitted": len(users), "completed": 0, "checked": 0, "errors": 0, "rate_limited": 0}
     counters_lock = threading.Lock()
 
     # Launch per-token worker threads
