@@ -604,6 +604,12 @@ def main():
         default=100,
         help="Number of threads for enumeration (default: 100)"
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=5,
+        help="Request timeout in seconds for enumeration (default: 5)"
+    )
 
     args = parser.parse_args()
 
@@ -821,11 +827,11 @@ def _run_enumerate(args):
         print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
     if proxy_urls:
-        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)}")
+        print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(args.timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}")
     else:
-        print_info(f"No --aci-urls provided — going direct | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)}")
+        print_info(f"No --aci-urls provided — going direct | Threads: {style(str(args.threads), TermColors.MAGENTA, TermColors.BOLD)} | Timeout: {style(str(args.timeout) + 's', TermColors.MAGENTA, TermColors.BOLD)}")
 
-    enumerator = OneDriveEnumerator(proxy_urls, threads=args.threads, debug=args.verbose)
+    enumerator = OneDriveEnumerator(proxy_urls, threads=args.threads, timeout=args.timeout, debug=args.verbose)
     valid_users, counters = enumerator.enumerate(users, tenant_name, logger)
 
     _print_enum_summary(logger, valid_users, users, counters)
