@@ -129,6 +129,7 @@ def deploy(regions, count, outfile):
                 f"--image {image_name} "
                 f"--cpu 0.5 --memory 0.5 "
                 f"--ports 8080 "
+                f"--os-type Linux "
                 f"--ip-address Public "
                 f"--location {region} "
                 f"--registry-login-server {acr_server} "
