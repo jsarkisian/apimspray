@@ -132,6 +132,17 @@ class OneDriveEnumerator:
         progress_thread = threading.Thread(target=progress_printer, daemon=True)
         progress_thread.start()
 
+        # One persistent session per proxy URL — shared across threads for connection reuse
+        sessions = {p: requests.Session() for p in proxy_pool}
+
+        # Shared round-robin proxy iterator
+        proxy_iter = itertools.cycle(proxy_pool)
+        proxy_iter_lock = threading.Lock()
+
+        def next_proxy():
+            with proxy_iter_lock:
+                return next(proxy_iter)
+
         def run_pass(upn_list):
             q = queue.Queue()
             for u in upn_list:
@@ -139,47 +150,34 @@ class OneDriveEnumerator:
             errored = []
             errored_lock = threading.Lock()
 
-            # Shared round-robin proxy iterator — all threads advance this together
-            proxy_iter = itertools.cycle(proxy_pool)
-            proxy_iter_lock = threading.Lock()
-
-            def next_proxy():
-                with proxy_iter_lock:
-                    return next(proxy_iter)
-
             def worker():
-                # Each thread gets its own session for persistent connections
-                session = requests.Session()
-                try:
-                    while True:
-                        try:
-                            upn = q.get_nowait()
-                        except queue.Empty:
-                            break
-                        proxy_url = next_proxy()
-                        try:
-                            result = self._check_user(upn, tenant_name, proxy_url, session=session)
-                            if self.debug:
-                                color = '32' if result == 'valid' else '31' if result == 'error' else '2'
-                                print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
-                            with results_lock:
-                                counters["completed"] += 1
-                                if result == "valid":
-                                    counters["valid"] += 1
-                                    valid_users.add(upn)
-                                    print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
-                                    if logger:
-                                        logger.log_result("enumerated", upn)
-                                elif result == "not_found":
-                                    counters["not_found"] += 1
-                                else:
-                                    counters["errors"] += 1
-                                    with errored_lock:
-                                        errored.append(upn)
-                        finally:
-                            q.task_done()
-                finally:
-                    session.close()
+                while True:
+                    try:
+                        upn = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    proxy_url = next_proxy()
+                    try:
+                        result = self._check_user(upn, tenant_name, proxy_url, session=sessions[proxy_url])
+                        if self.debug:
+                            color = '32' if result == 'valid' else '31' if result == 'error' else '2'
+                            print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
+                        with results_lock:
+                            counters["completed"] += 1
+                            if result == "valid":
+                                counters["valid"] += 1
+                                valid_users.add(upn)
+                                print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
+                                if logger:
+                                    logger.log_result("enumerated", upn)
+                            elif result == "not_found":
+                                counters["not_found"] += 1
+                            else:
+                                counters["errors"] += 1
+                                with errored_lock:
+                                    errored.append(upn)
+                    finally:
+                        q.task_done()
 
             with ThreadPoolExecutor(max_workers=n_threads) as executor:
                 futures = [executor.submit(worker) for _ in range(n_threads)]
@@ -205,4 +203,7 @@ class OneDriveEnumerator:
             pending = run_pass(pending)
 
         stop_progress.set()
+        progress_thread.join(timeout=2)
+        for s in sessions.values():
+            s.close()
         return valid_users, counters
