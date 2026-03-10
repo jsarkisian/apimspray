@@ -16,6 +16,7 @@ import queue
 import random
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -98,6 +99,26 @@ class OneDriveEnumerator:
         results_lock = threading.Lock()
         counters = {"completed": 0, "valid": 0, "not_found": 0, "errors": 0}
 
+        total = len(users)
+        start_time = time.time()
+        stop_progress = threading.Event()
+
+        def progress_printer():
+            while not stop_progress.wait(10):
+                with results_lock:
+                    done = counters["completed"]
+                    found = counters["valid"]
+                elapsed = int(time.time() - start_time)
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = total - done
+                eta = int(remaining / rate) if rate > 0 else 0
+                eta_str = f"{eta//60}m{eta%60:02d}s" if eta > 0 else "?"
+                print(f"[*] Progress: {done}/{total} | Found: {found} | "
+                      f"{rate:.1f} req/s | ETA: {eta_str}")
+
+        progress_thread = threading.Thread(target=progress_printer, daemon=True)
+        progress_thread.start()
+
         def worker(proxy_url):
             while True:
                 try:
@@ -111,7 +132,9 @@ class OneDriveEnumerator:
                         if result == "valid":
                             counters["valid"] += 1
                             valid_users.add(upn)
-                            logger.log_result("enumerated", upn)
+                            print(f"[+] VALID: {upn}")
+                            if logger:
+                                logger.log_result("enumerated", upn)
                         elif result == "not_found":
                             counters["not_found"] += 1
                         else:
@@ -128,4 +151,5 @@ class OneDriveEnumerator:
                 except Exception:
                     pass
 
+        stop_progress.set()
         return valid_users, counters
