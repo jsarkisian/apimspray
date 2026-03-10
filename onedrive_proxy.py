@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 
+import requests
+
 
 class Colors:
     RED = '\033[31m'
@@ -81,9 +83,33 @@ def derive_sharepoint_host(tenant, domain=None):
     return f"{name}-my.sharepoint.com"
 
 
+def verify_tenant(sharepoint_host):
+    """
+    Check that the SharePoint hostname exists and responds like a real tenant.
+
+    A valid tenant returns 200, 302, or 403.
+    A non-existent tenant typically returns 404 or redirects to a Microsoft error page.
+    Returns (ok: bool, status_code: int or None)
+    """
+    url = f"https://{sharepoint_host}/_layouts/15/onedrive.aspx"
+    try:
+        resp = requests.get(url, timeout=10, allow_redirects=True)
+        return resp.status_code in (200, 302, 403), resp.status_code
+    except requests.RequestException as e:
+        return False, None
+
+
 def deploy(tenant, domain, regions, count, outfile):
     """Deploy ACI containers as OneDrive enum proxies."""
     sharepoint_host = derive_sharepoint_host(tenant, domain)
+
+    # Verify tenant exists before spending time on Azure resources
+    log("info", f"Verifying tenant: {sharepoint_host}...")
+    ok, status = verify_tenant(sharepoint_host)
+    if not ok:
+        status_str = str(status) if status else "no response"
+        die(f"Tenant verification failed for {sharepoint_host} (HTTP {status_str}). "
+            f"Check that the tenant exists and has SharePoint/OneDrive enabled.")
     timestamp = int(time.time())
     rg_name = f"{RG_PREFIX}{timestamp}"
     acr_name = f"{ACR_PREFIX}{timestamp}"
