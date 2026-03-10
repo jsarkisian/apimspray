@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/crtvrffnrt/apimspray">
+  <a href="https://github.com/jsarkisian/apimspray">
     <img src="https://img.shields.io/badge/GitHub-Repository-black?style=for-the-badge&logo=github">
   </a>
   <a href="https://shell.azure.com/bash">
@@ -17,66 +17,175 @@
 ## apimspray
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![Azure](https://img.shields.io/badge/Azure-APIM-blue?logo=microsoftazure)
+![Azure](https://img.shields.io/badge/Azure-APIM%20%2B%20ACI-blue?logo=microsoftazure)
 ![License](https://img.shields.io/badge/License-Research--Only-lightgrey)
 ![Status](https://img.shields.io/badge/Status-Active%20Development-green)
 
-apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for authorized security research and Red Teaming. It utilizes Azure API Management (APIM) gateways as a distributed, rotating proxy layer for IP Rotating.
+apimspray is a specialized **Entra ID Assessment Toolkit** designed for authorized security research and Red Teaming. It provides two capabilities:
+
+- **Password Spraying** via Azure API Management (APIM) gateways as a distributed, rotating proxy layer
+- **User Enumeration** via passive OneDrive URL probing distributed across Azure Container Instances (ACI)
+
+---
 
 ## Prerequisites
 
-- **Azure CLI (`az`)**: Required for the rotator script to deploy resources. (Execute script from cli session already authenticated to az cli or use Azure Cloud Shell)
-- **Active Azure Subscription**: To deploy APIM Consumption tier resources (Cost is negligible, typically <$0.01 for short assessments).
+- **Python 3.10+**
+- **Azure CLI (`az`)**: Required to deploy proxy resources. Must be authenticated (`az login`) before running any deployer script.
+- **Active Azure Subscription**: APIM Consumption tier and ACI costs are negligible for short assessments.
 
 ### Installation
 
-1. Clone the repository.
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Ensure you are logged into Azure CLI:
-   ```bash
-   az login
-   ```
-   _Note: The rotator script relies on an active background Azure CLI session to deploy resources._
-
-## Setup
-
-### Quick Start (Azure Cloud Shell)
-
-Run apimspray directly from an authenticated Azure environment.
-
-<a href="https://shell.azure.com/bash">
-  <img src="https://az-icons.com/api/icon/azure-cloud-shell/download?format=png"
-       alt="Open in Azure Cloud Shell"
-       width="180" />
-</a>
-
 ```bash
-git clone https://github.com/crtvrffnrt/apimspray.git
+git clone https://github.com/jsarkisian/apimspray.git
 cd apimspray
-python3 apimspray.py --help
+pip install -r requirements.txt
+az login
 ```
 
-### 1. Deploy Gateways
+---
 
-Deploys all APIM instances in a single Bicep deployment for maximum speed.
+## Tool Overview
+
+| Script | Purpose |
+|--------|---------|
+| `apimspray.py` | Main tool — spray, validate, enumerate |
+| `apimcreate.py` | Deploy APIM gateways for spray/validate |
+| `onedrive_proxy.py` | Deploy ACI proxies for user enumeration |
+| `generate_upns.py` | Generate UPN wordlists from tenant domains |
+
+---
+
+## Mode 1: User Enumeration (OneDrive)
+
+Passively checks whether users exist by probing their OneDrive URL. No authentication required — does not trigger login events or lockouts.
+
+**How it works:** A valid user returns HTTP 403 (OneDrive exists but access denied). An invalid user returns 404.
+
+### Step 1: Deploy ACI Proxies
+
+ACI containers are deployed across Azure regions, each with a unique public IP, to distribute enumeration traffic.
+
+```bash
+# Deploy 50 proxies (auto-distributes across all US regions)
+python3 onedrive_proxy.py --deploy --tenant contoso.com --count 50 --outfile enum_urls.txt
+
+# Deploy into specific regions
+python3 onedrive_proxy.py --deploy --tenant contoso.com --count 30 \
+    --regions eastus,westus,westeurope --outfile enum_urls.txt
+
+# Clean up when done
+python3 onedrive_proxy.py --destroy
+```
+
+> The deployer verifies the tenant exists before spending time on Azure resources. If the SharePoint host is unreachable, it aborts immediately.
+
+**onedrive_proxy CLI reference:**
+
+```text
+usage: onedrive_proxy.py [--deploy] [--destroy] [--delete-old]
+                         [--tenant TENANT] [--domain DOMAIN]
+                         [--regions REGIONS] [--count COUNT] [--outfile OUTFILE]
+
+options:
+  --deploy              Deploy ACI containers
+  --destroy             Delete all odproxy resource groups
+  --delete-old          Delete old odproxy resource groups before deploying
+  --tenant TENANT       Target tenant/domain (e.g. contoso.com)
+  --domain DOMAIN       Domain hint (required if --tenant is a UUID)
+  --regions REGIONS     Comma-separated regions (default: all US regions)
+  --count COUNT         Number of containers to deploy (default: 10)
+  --outfile OUTFILE     Output file for proxy URLs
+```
+
+Default regions (when `--regions` is not set): `eastus`, `eastus2`, `westus`, `westus2`, `westus3`, `centralus`, `northcentralus`, `southcentralus`, `westcentralus`
+
+> **Quota note:** Azure limits ACI to 10 CPU cores per region (~20 containers at 0.5 CPU each). Spreading across regions avoids hitting this limit.
+
+### Step 2: Build a Username List (Optional)
+
+If you don't have a user list, generate one from the target tenant's domains:
+
+```bash
+python3 generate_upns.py --target contoso.com
+# OR
+python3 generate_upns.py --target 00000000-0000-0000-0000-000000000000
+```
+
+### Step 3: Run Enumeration
+
+```bash
+# With proxies (recommended) — no --tenant needed, proxies are already configured
+python3 apimspray.py --mode enumerate --users users.txt --aci-urls enum_urls.txt --enum-pace turbo
+
+# Without proxies (single IP, slower)
+python3 apimspray.py --mode enumerate --users users.txt --tenant contoso.com
+```
+
+### Enumeration Speed Templates (`--enum-pace`)
+
+Thread count scales automatically with proxy count. Timeout is fixed per template.
+
+| Template | Threads/Proxy | Timeout | Threads with 50 proxies | Threads with 25 proxies |
+|----------|:---:|:---:|:---:|:---:|
+| `turbo`  | 20 | 30s | 1000 | 500 |
+| `high`   | 10 | 25s | 500  | 250 |
+| `medium` |  5 | 20s | 250  | 125 |
+| `low`    |  2 | 15s | 100  |  50 |
+| `stealth`|  1 | 10s |  50  |  25 |
+
+```bash
+python3 apimspray.py --mode enumerate --users users.txt --aci-urls enum_urls.txt --enum-pace turbo
+```
+
+### Enumeration Options
+
+```text
+  --aci-urls ACI_URLS          Path to ACI proxy URLs file (from onedrive_proxy.py)
+  --enum-pace {turbo,high,medium,low,stealth}
+                               Speed template — overrides --threads and --timeout
+  --threads THREADS            Number of threads (default: 100). Overridden by --enum-pace.
+  --timeout TIMEOUT            Request timeout in seconds (default: 5). Overridden by --enum-pace.
+  --retries N                  Retry errored users N times at end of run (default: 1)
+  --tenant TENANT              Required only when not using --aci-urls
+  --domain DOMAIN              Append domain to users if missing
+  --randomize-users            Shuffle user list before enumeration
+  --verbose                    Print per-request debug output (URL, status, errors)
+  --output OUTPUT              Output directory (default: results)
+```
+
+### Enumeration Output
+
+Results are stored in `results/<timestamp>/`:
+
+- `enumerated_<timestamp>.txt` — confirmed valid users (one per line)
+
+Valid users are also printed in real-time during the run:
+```
+[+] VALID: john.doe@contoso.com
+```
+
+Progress is printed every 10 seconds:
+```
+[*] Progress: 12000/48000 | Found: 34 | 312.4 req/s | ETA: 2m03s
+```
+
+---
+
+## Mode 2: Password Spraying / Validation (APIM)
+
+Uses Azure API Management gateways as rotating proxies to spray passwords against Entra ID without triggering IP-based lockouts.
+
+### Step 1: Deploy APIM Gateways
 
 ```bash
 # Deploy 33 login gateways
 python3 apimcreate.py --type login --count 33 --outfile urls.txt
 
-# Deploy 10 Teams gateways
-python3 apimcreate.py --type teams --count 10 --outfile teams_urls.txt
-
-# Deploy both login and Teams gateways in one deployment
-python3 apimcreate.py --type both --count 33 --outfile urls.txt --teams-outfile teams_urls.txt
-
 # Deploy into specific regions
 python3 apimcreate.py --type login --location germanywestcentral,westeurope --count 33 --outfile urls.txt
 
-# Clean up old deployments
+# Clean up
 python3 apimcreate.py --type login --delete-only
 ```
 
@@ -84,147 +193,112 @@ python3 apimcreate.py --type login --delete-only
 
 ```text
 usage: apimcreate.py [-h] --type {login,teams,both} [--count COUNT] [--outfile OUTFILE]
-                     [--teams-outfile TEAMS_OUTFILE] [--location LOCATION] [--prefix PREFIX]
-                     [--delete-old] [--delete-only]
-
-apimcreate - Unified Azure APIM Deployer (Bicep)
+                     [--location LOCATION] [--prefix PREFIX] [--delete-old] [--delete-only]
 
 options:
-  -h, --help            show this help message and exit
-  --type {login,teams,both}
-                        Type of APIM gateways to deploy
+  --type {login,both}   Type of APIM gateways to deploy
   --count COUNT         Number of instances per type
-  --outfile OUTFILE     Output file for login gateway URLs
-  --teams-outfile TEAMS_OUTFILE
-                        Output file for Teams gateway URLs (required with --type both)
+  --outfile OUTFILE     Output file for gateway URLs
   --location LOCATION   Comma-separated APIM location(s)
-  --prefix PREFIX       API URL prefix (default: oauth for login, teamsmt for teams)
+  --prefix PREFIX       API URL prefix (default: oauth)
   --delete-old          Delete old resource groups before deploying
   --delete-only         Only delete old resource groups
 ```
 
-**Important:** For all methods, you must have an active `az` session in the background (`az login`).
+### Step 2: Spray or Validate
 
-### 2. Prepare Wordlists
+**spray** — one password tested against all users, repeats for each password:
+```bash
+python3 apimspray.py --mode spray \
+    --urls urls.txt \
+    --users users.txt \
+    --passwords passwords.txt \
+    --pace medium \
+    --tenant contoso.com
+```
 
-Ensure you have your target lists ready:
+**validate** — 1:1 user:password pair testing (equal-length lists):
+```bash
+python3 apimspray.py --mode validate \
+    --urls urls.txt \
+    --users users.txt \
+    --passwords passwords.txt \
+    --tenant contoso.com
+```
 
-- `users.txt`: List of UserPrincipalNames (e.g., `user@domain.com`).
-- `passwords.txt`: List of passwords to spray.
+### Spray Pacing Profiles (`--pace`)
 
-### 3. Reconnaissance / UPN Generation (Optional)
+| Profile   | Workers | Delay | Chunk | Lockout Wait | Safe Threshold | Jitter |
+|:----------|:-------:|:-----:|:-----:|:------------:|:--------------:|:------:|
+| `high`    |   15    | 0.1s  |  10   |     5m       |   20 locked    |   0%   |
+| `medium`  |    5    | 1.0s  |   5   |    10m       |   10 locked    |  10%   |
+| `low`     |    2    | 5.0s  |   2   |    15m       |    5 locked    |  20%   |
+| `stealth` |    1    | 30.0s |   1   |    20m       |    1 locked    |  40%   |
 
-If you do not have a user list, you can use the helper script `generate_upns.py`. This tool:
+- **Chunk**: Passwords attempted per user before pausing for lockout timers to reset
+- **Lockout Wait**: Sleep time between chunks
+- **Safe Threshold**: Abort if this many accounts hit `AADSTS50053` (Smart Lockout)
+- **Jitter**: Randomizes delay to avoid static timing detection
 
-1. Queries the target Azure tenant to discover all connected and verified domains.
-2. Downloads a list of statistically likely service account usernames from GitHub.
-3. Generates a permutation list of UPNs (UserPrincipalNames) and saves them to `users.txt`.
+### Spray/Validate Options
 
-**Usage:**
+```text
+  --urls URLS                  Path to APIM gateway URLs file
+  --users USERS                Path to users file
+  --passwords PASSWORDS        Path to passwords file
+  --tenant TENANT              Tenant ID or domain (default: common)
+  --domain DOMAIN              Append domain to users if missing
+  --pace {stealth,low,medium,high}
+                               Pacing profile (default: low)
+  --continue-on-success        Keep spraying after finding valid credentials
+  --randomize-users            Shuffle user order before each round
+  --verbose                    Enable progress output (press Enter to print status)
+  --output OUTPUT              Output directory (default: results)
+```
+
+### Spray/Validate Output
+
+Results are stored in `results/<timestamp>/`:
+
+- `valid_*.txt` — successful authentications (MFA required or token received)
+- `blocked_*.txt` — locked or conditionally blocked accounts
+- `failed_*.txt` — invalid credentials or user not found
+
+---
+
+## Typical Workflow
 
 ```bash
-# Generate users.txt for a specific domain or tenant ID
-python3 generate_upns.py --target example.com
-# OR using Tenantid
-python3 generate_upns.py --target 00000000-0000-0000-0000-000000000000
+# 1. Generate username list
+python3 generate_upns.py --target contoso.com
+
+# 2. Deploy ACI proxies for enumeration
+python3 onedrive_proxy.py --deploy --tenant contoso.com --count 50 --outfile enum_urls.txt
+
+# 3. Enumerate valid users
+python3 apimspray.py --mode enumerate --users users.txt --aci-urls enum_urls.txt --enum-pace turbo
+
+# 4. Deploy APIM gateways for spraying
+python3 apimcreate.py --type login --count 33 --outfile spray_urls.txt
+
+# 5. Spray enumerated users
+python3 apimspray.py --mode spray \
+    --urls spray_urls.txt \
+    --users results/<timestamp>/enumerated_<timestamp>.txt \
+    --passwords passwords.txt \
+    --tenant contoso.com \
+    --pace medium
+
+# 6. Clean up
+python3 onedrive_proxy.py --destroy
+python3 apimcreate.py --type login --delete-only
 ```
 
-**generate_upns CLI reference:**
-
-```text
-usage: generate_upns.py [-h] --target TARGET
-
-Generate UPNs from connected Azure Tenants and Service Accounts.
-
-options:
-  -h, --help       show this help message and exit
-  --target TARGET  Target Domain (e.g., example.com) or Tenant UUID
-```
-
-## Usage
-
-```text
-usage: apimspray.py [-h] [--urls URLS] [--teams-urls TEAMS_URLS] [--users USERS]
-                    [--passwords PASSWORDS] [--output OUTPUT] [--tenant TENANT]
-                    [--domain DOMAIN] --mode {spray,validate,enumerate}
-                    [--pace {stealth,low,mid,medium,high}] [--continue-on-success]
-                    [--randomize-users] [--verbose] [--sac-user SAC_USER]
-                    [--sac-pass SAC_PASS] [--sac-accounts SAC_ACCOUNTS]
-                    [--teams-region {amer,emea,apac}] [--no-presence] [--skip-sanity]
-
-apimspray - Entra ID Assessment Tool (with Teams Enumeration)
-
-options:
-  -h, --help            show this help message and exit
-  --urls URLS           Path to APIM URLs file (login gateways, from apimcreate.py)
-  --teams-urls TEAMS_URLS
-                        Path to Teams APIM URLs file (from apimcreate.py --type teams)
-  --users USERS         Path to users file
-  --passwords PASSWORDS
-                        Path to passwords file
-  --output OUTPUT       Output directory
-  --tenant TENANT       Tenant ID or Domain
-  --domain DOMAIN       Append domain to users if missing
-  --mode {spray,validate,enumerate}
-                        Operation mode:
-                         - spray:      Test all passwords against all users (1:N) via APIM.
-                         - validate:   Perform 1:1 credential pair testing via APIM.
-                         - enumerate:  Enumerate valid users via Microsoft Teams external search.
-  --pace {stealth,low,mid,medium,high}
-                        Pacing profile for requests and lockout management.
-  --continue-on-success
-                        Continue the assessment even after finding valid credentials.
-  --randomize-users     Randomize user order before each round.
-  --sac-user SAC_USER   Sacrificial O365 username for Teams enumeration
-  --sac-pass SAC_PASS   Sacrificial O365 password for Teams enumeration
-  --sac-accounts SAC_ACCOUNTS
-                        Path to file with additional sacrificial accounts (user:pass per line).
-                        Each account adds ~45 req/s to the enumeration pool.
-  --teams-region {amer,emea,apac}
-                        Teams API region hint (default: amer).
-  --no-presence         Skip presence/out-of-office fetching during enumeration.
-  --skip-sanity         Skip the pre-enumeration sanity check.
-```
-
-### Modes
-
-- **validate**: Checks a list of `user:password` pairs. Requires equal length lists.
-
-  ```bash
-  python3 apimspray.py --urls urls.txt --mode validate --users u.txt --passwords p.txt
-  ```
-
-- **spray**: Attempts one password against all users, then waits (if configured), then moves to the next password.
-  ```bash
-  python3 apimspray.py --urls urls.txt --mode spray --users users.txt --passwords common_passwords.txt --pace medium
-  ```
-
-### Pacing Profiles
-
-The `--pace` argument controls the aggressiveness of the spray. Values are hardcoded to ensure stability and safety.
-
-| Profile   | Workers | Delay | Count (Chunk) | Lockout Wait | Safe Threshold | Jitter |
-| :-------- | :-----: | :---: | :-----------: | :----------: | :------------: | :----: |
-| `high`    |   15    | 0.1s  |      10       |      5m      |   20 locked    |   0%   |
-| `medium`  |    5    | 1.0s  |       5       |     10m      |   10 locked    |  10%   |
-| `low`     |    2    | 5.0s  |       2       |     15m      |    5 locked    |  20%   |
-| `stealth` |    1    | 30.0s |       1       |     20m      |    1 locked    |  40%   |
-
-- **Count**: Number of passwords to try per user before pausing to let lockout timers reset.
-- **Lockout Wait**: Time to sleep between password chunks.
-- **Safe Threshold**: If this many accounts get locked (`AADSTS50053`), the tool aborts immediately.
-- **Jitter**: Randomizes the delay to evade static timing analysis.
-
-## Output
-
-Results are stored in the `results/<timestamp>/` directory:
-
-- `valid_*.txt`: Successful authentications (MFA Required or Token received).
-- `blocked_*.txt`: Locked or conditionally blocked accounts.
-- `failed_*.txt`: Invalid credentials or user not found.
+---
 
 ## Credits & References
 
-- **o365spray**: Logic inspiration for ROPC flow.
-- **TeamFiltration**: Design inspiration for tool structure.
-- **FireProx**: The grandfather of cloud gateway rotation techniques.
+- **o365spray**: Logic inspiration for ROPC flow
+- **nyxgeek/onedrive_user_enum**: OneDrive enumeration technique
+- **TeamFiltration**: Design inspiration for tool structure
+- **FireProx**: The grandfather of cloud gateway rotation techniques
