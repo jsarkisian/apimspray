@@ -562,7 +562,7 @@ def main():
     parser.add_argument("--users", help="Path to users file")
     parser.add_argument("--passwords", help="Path to passwords file")
     parser.add_argument("--output", default="results", help="Output directory")
-    parser.add_argument("--tenant", default="common", help="Tenant ID or Domain")
+    parser.add_argument("--tenant", default=None, help="Tenant ID or Domain (required for spray/validate and for enumerate without --aci-urls)")
     parser.add_argument("--domain", help="Append domain to users if missing")
     parser.add_argument(
         "--mode",
@@ -705,7 +705,7 @@ def main():
                 if current_delay > 0 and workers == 1:
                     time.sleep(current_delay)
                 future = executor.submit(
-                    process_attempt, target, apim_manager, args.tenant, pace_config,
+                    process_attempt, target, apim_manager, args.tenant or "common", pace_config,
                     logger, locked_users_set, invalid_users_set, lockout_counts,
                     lock, args.continue_on_success, stop_event,
                 )
@@ -789,12 +789,6 @@ def _run_enumerate(args):
         random.shuffle(users)
         print_info(f"User list randomized ({len(users)} users shuffled)")
 
-    try:
-        tenant_name = derive_sharepoint_host(args.tenant, args.domain).split("-my.")[0]
-    except ValueError as e:
-        print_error(str(e))
-        sys.exit(1)
-
     proxy_urls = []
     if getattr(args, "aci_urls", None):
         if not Path(args.aci_urls).exists():
@@ -802,11 +796,23 @@ def _run_enumerate(args):
         else:
             proxy_urls = load_file_lines(args.aci_urls)
 
+    tenant_name = None
+    if not proxy_urls:
+        if not args.tenant:
+            print_error("--tenant is required when not using --aci-urls")
+            sys.exit(1)
+        try:
+            tenant_name = derive_sharepoint_host(args.tenant, args.domain).split("-my.")[0]
+        except ValueError as e:
+            print_error(str(e))
+            sys.exit(1)
+
     logger = Logger(args.output)
 
     print_info(f"Starting apimspray")
     print_info(f"Mode: {style('enumerate', TermColors.MAGENTA, TermColors.BOLD)} (OneDrive User Enumeration)")
-    print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
+    if tenant_name:
+        print_info(f"Tenant: {style(tenant_name, TermColors.CYAN, TermColors.BOLD)}")
     print_info(f"Candidate Users: {style(str(len(users)), TermColors.MAGENTA, TermColors.BOLD)}")
     if proxy_urls:
         print_info(f"ACI Proxies: {style(str(len(proxy_urls)), TermColors.MAGENTA, TermColors.BOLD)} (one thread per IP)")
