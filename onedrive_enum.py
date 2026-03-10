@@ -111,23 +111,36 @@ class OneDriveEnumerator:
         start_time = time.time()
         stop_progress = threading.Event()
 
+        ERROR_WARN_THRESHOLD = 0.20  # warn if >20% of completed are errors
+        error_warned = [False]
+
         def progress_printer():
             while not stop_progress.wait(10):
                 with results_lock:
                     done = counters["completed"]
                     found = counters["valid"]
+                    errors = counters["errors"]
                 elapsed = int(time.time() - start_time)
                 rate = done / elapsed if elapsed > 0 else 0
                 remaining = total - done
                 eta = int(remaining / rate) if rate > 0 else 0
                 eta_str = f"{eta//60}m{eta%60:02d}s" if eta > 0 else "?"
+                err_str = f" | Errors: {_c(str(errors), '1', '31')}" if errors else ""
                 print(
                     f"{_c('[*]', '1', '36')} Progress: "
                     f"{_c(str(done), '1')}/{_c(str(total), '1')} | "
                     f"Found: {_c(str(found), '1', '32')} | "
                     f"{_c(f'{rate:.1f} req/s', '35')} | "
                     f"ETA: {_c(eta_str, '33')}"
+                    f"{err_str}"
                 )
+                # Warn once if error rate is excessive
+                if not error_warned[0] and done >= 50 and errors / done > ERROR_WARN_THRESHOLD:
+                    error_warned[0] = True
+                    print(
+                        f"{_c('[!]', '1', '33')} High error rate ({errors}/{done} = {errors/done:.0%}) — "
+                        f"likely proxy timeouts. Try --timeout {self.timeout + 10} or fewer --threads."
+                    )
 
         progress_thread = threading.Thread(target=progress_printer, daemon=True)
         progress_thread.start()
