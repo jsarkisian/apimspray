@@ -796,8 +796,11 @@ def _run_enumerate(args):
         sys.exit(1)
 
     proxy_urls = []
-    if getattr(args, "aci_urls", None) and Path(args.aci_urls).exists():
-        proxy_urls = load_file_lines(args.aci_urls)
+    if getattr(args, "aci_urls", None):
+        if not Path(args.aci_urls).exists():
+            print_warn(f"--aci-urls file not found: {args.aci_urls} — falling back to direct enumeration")
+        else:
+            proxy_urls = load_file_lines(args.aci_urls)
 
     logger = Logger(args.output)
 
