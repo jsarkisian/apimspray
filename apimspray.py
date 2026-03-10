@@ -152,7 +152,6 @@ class Logger:
             "blocked": self.run_dir / f"blocked_{self.timestamp}.txt",
             "failed": self.run_dir / f"failed_{self.timestamp}.txt",
             "enumerated": self.run_dir / f"enumerated_{self.timestamp}.txt",
-            "enum_details": self.run_dir / f"enum_details_{self.timestamp}.json",
         }
         self.locks = {k: threading.Lock() for k in self.files}
 
@@ -165,12 +164,6 @@ class Logger:
         with self.locks[result_type]:
             with open(self.files[result_type], "a", encoding="utf-8") as f:
                 f.write(f"{utc_now_str()} | {file_message}\n")
-
-    def log_enum_detail(self, detail_dict):
-        """Appends a JSON object to the enum details file (one JSON object per line)."""
-        with self.locks["enum_details"]:
-            with open(self.files["enum_details"], "a", encoding="utf-8") as f:
-                f.write(json.dumps(detail_dict) + "\n")
 
 class ProgressTracker:
     """Thread-safe progress tracker that prints status when the user hits Enter."""
@@ -780,7 +773,7 @@ def main():
 
 def _run_enumerate(args):
     """Execute OneDrive-based user enumeration."""
-    from onedrive_enum import OneDriveEnumerator, build_onedrive_path
+    from onedrive_enum import OneDriveEnumerator
     from onedrive_proxy import derive_sharepoint_host
 
     if not args.users:
