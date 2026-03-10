@@ -12,6 +12,7 @@ Response interpretation:
   other          -> unknown / error
 """
 
+import itertools
 import os
 import queue
 import re
@@ -60,7 +61,7 @@ class OneDriveEnumerator:
         self.retries = retries
         self.debug = debug
 
-    def _check_user(self, upn, tenant_name=None, proxy_url=None):
+    def _check_user(self, upn, tenant_name=None, proxy_url=None, session=None):
         """
         Make a single OneDrive check for a UPN.
 
@@ -72,8 +73,9 @@ class OneDriveEnumerator:
         else:
             url = f"https://{tenant_name}-my.sharepoint.com/{path}"
 
+        requester = session or requests
         try:
-            resp = requests.get(url, timeout=self.timeout, allow_redirects=False)
+            resp = requester.get(url, timeout=self.timeout, allow_redirects=False)
             if resp.status_code in (302, 403):
                 return "valid"
             elif resp.status_code == 404:
@@ -135,39 +137,52 @@ class OneDriveEnumerator:
             for u in upn_list:
                 q.put(u)
             errored = []
+            errored_lock = threading.Lock()
 
-            def worker(proxy_url):
-                while True:
-                    try:
-                        upn = q.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        result = self._check_user(upn, tenant_name, proxy_url)
-                        if self.debug:
-                            color = '32' if result == 'valid' else '31' if result == 'error' else '2'
-                            print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
-                        with results_lock:
-                            counters["completed"] += 1
-                            if result == "valid":
-                                counters["valid"] += 1
-                                valid_users.add(upn)
-                                print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
-                                if logger:
-                                    logger.log_result("enumerated", upn)
-                            elif result == "not_found":
-                                counters["not_found"] += 1
-                            else:
-                                counters["errors"] += 1
-                                with results_lock:
-                                    pass  # tracked below
-                                errored.append(upn)
-                    finally:
-                        q.task_done()
+            # Shared round-robin proxy iterator — all threads advance this together
+            proxy_iter = itertools.cycle(proxy_pool)
+            proxy_iter_lock = threading.Lock()
+
+            def next_proxy():
+                with proxy_iter_lock:
+                    return next(proxy_iter)
+
+            def worker():
+                # Each thread gets its own session for persistent connections
+                session = requests.Session()
+                try:
+                    while True:
+                        try:
+                            upn = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        proxy_url = next_proxy()
+                        try:
+                            result = self._check_user(upn, tenant_name, proxy_url, session=session)
+                            if self.debug:
+                                color = '32' if result == 'valid' else '31' if result == 'error' else '2'
+                                print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
+                            with results_lock:
+                                counters["completed"] += 1
+                                if result == "valid":
+                                    counters["valid"] += 1
+                                    valid_users.add(upn)
+                                    print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
+                                    if logger:
+                                        logger.log_result("enumerated", upn)
+                                elif result == "not_found":
+                                    counters["not_found"] += 1
+                                else:
+                                    counters["errors"] += 1
+                                    with errored_lock:
+                                        errored.append(upn)
+                        finally:
+                            q.task_done()
+                finally:
+                    session.close()
 
             with ThreadPoolExecutor(max_workers=n_threads) as executor:
-                futures = [executor.submit(worker, proxy_pool[i % len(proxy_pool)])
-                           for i in range(n_threads)]
+                futures = [executor.submit(worker) for _ in range(n_threads)]
                 for f in as_completed(futures):
                     try:
                         f.result()
