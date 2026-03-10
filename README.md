@@ -61,6 +61,12 @@ Passively checks whether users exist by probing their OneDrive URL. No authentic
 
 **How it works:** A valid user returns HTTP 403 (OneDrive exists but access denied). An invalid user returns 404.
 
+**NOTE: You will need the tenant name before you can enumerate users properly. Refer to the following for more info:**
+
+Easy Lookup: https://sub2tenant.com/<BR>
+Trimarc Details: https://www.trimarcsecurity.com/hub-post/enumerating-entra-id-anonymously<BR>
+AADInternals Tool: https://aadinternals.com/aadinternals/
+
 ### Step 1: Deploy ACI Proxies
 
 ACI containers are deployed across Azure regions, each with a unique public IP, to distribute enumeration traffic.
