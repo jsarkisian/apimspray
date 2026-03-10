@@ -284,6 +284,7 @@ python3 apimcreate.py --type login --delete-only
 
 ## Credits & References
 
+- **[crtvrffnrt/apimspray](https://github.com/crtvrffnrt/apimspray)**: Original tool and core concept — this project is built on their work
 - **o365spray**: Logic inspiration for ROPC flow
 - **nyxgeek/onedrive_user_enum**: OneDrive enumeration technique
 - **TeamFiltration**: Design inspiration for tool structure
