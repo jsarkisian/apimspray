@@ -53,10 +53,11 @@ class OneDriveEnumerator:
     Falls back to a single direct thread when no proxies are provided.
     """
 
-    def __init__(self, proxy_urls=None, threads=100, timeout=5, debug=False):
+    def __init__(self, proxy_urls=None, threads=100, timeout=5, retries=1, debug=False):
         self.proxy_urls = list(proxy_urls) if proxy_urls else []
         self.threads = threads
         self.timeout = timeout
+        self.retries = retries
         self.debug = debug
 
     def _check_user(self, upn, tenant_name=None, proxy_url=None):
@@ -129,40 +130,64 @@ class OneDriveEnumerator:
         progress_thread = threading.Thread(target=progress_printer, daemon=True)
         progress_thread.start()
 
-        def worker(proxy_url):
-            while True:
-                try:
-                    upn = user_queue.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    result = self._check_user(upn, tenant_name, proxy_url)
-                    if self.debug:
-                        color = '32' if result == 'valid' else '31' if result == 'error' else '2'
-                        print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
-                    with results_lock:
-                        counters["completed"] += 1
-                        if result == "valid":
-                            counters["valid"] += 1
-                            valid_users.add(upn)
-                            print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
-                            if logger:
-                                logger.log_result("enumerated", upn)
-                        elif result == "not_found":
-                            counters["not_found"] += 1
-                        else:
-                            counters["errors"] += 1
-                finally:
-                    user_queue.task_done()
+        def run_pass(upn_list):
+            q = queue.Queue()
+            for u in upn_list:
+                q.put(u)
+            errored = []
 
-        with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = [executor.submit(worker, proxy_pool[i % len(proxy_pool)])
-                       for i in range(n_threads)]
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception:
-                    pass
+            def worker(proxy_url):
+                while True:
+                    try:
+                        upn = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        result = self._check_user(upn, tenant_name, proxy_url)
+                        if self.debug:
+                            color = '32' if result == 'valid' else '31' if result == 'error' else '2'
+                            print(f"{_c('[DEBUG]', '2', '33')} {upn} -> {_c(result, color)} (proxy: {proxy_url})")
+                        with results_lock:
+                            counters["completed"] += 1
+                            if result == "valid":
+                                counters["valid"] += 1
+                                valid_users.add(upn)
+                                print(f"{_c('[+]', '1', '32')} {_c('VALID:', '1', '32')} {_c(upn, '32')}")
+                                if logger:
+                                    logger.log_result("enumerated", upn)
+                            elif result == "not_found":
+                                counters["not_found"] += 1
+                            else:
+                                counters["errors"] += 1
+                                with results_lock:
+                                    pass  # tracked below
+                                errored.append(upn)
+                    finally:
+                        q.task_done()
+
+            with ThreadPoolExecutor(max_workers=n_threads) as executor:
+                futures = [executor.submit(worker, proxy_pool[i % len(proxy_pool)])
+                           for i in range(n_threads)]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+
+            return errored
+
+        # Main pass
+        pending = list(users)
+        pending = run_pass(pending)
+
+        # Retry passes
+        for attempt in range(1, self.retries + 1):
+            if not pending:
+                break
+            print(f"{_c('[*]', '1', '36')} Retrying {_c(str(len(pending)), '1', '33')} errored users (attempt {attempt}/{self.retries})...")
+            counters["errors"] -= len(pending)  # will be re-counted in retry
+            counters["completed"] -= len(pending)
+            pending = run_pass(pending)
 
         stop_progress.set()
         return valid_users, counters
