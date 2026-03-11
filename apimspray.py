@@ -749,6 +749,11 @@ def main():
             for target in target_list:
                 if stop_event.is_set():
                     break
+                # Check safe threshold mid-round so stealth mode aborts promptly
+                with lock:
+                    if len(locked_users_set) >= pace_config["safe"]:
+                        stop_event.set()
+                        break
                 current_delay = base_delay
                 if pace_config["jitter"] > 0 and base_delay > 0:
                     jitter_val = (base_delay * pace_config["jitter"]) / 100.0
@@ -761,15 +766,14 @@ def main():
                     logger, locked_users_set, invalid_users_set, disabled_users_set, lockout_counts,
                     lock, args.continue_on_success, args.remove_disabled, stop_event,
                 )
+                if progress_tracker:
+                    future.add_done_callback(lambda _: progress_tracker.increment())
                 futures.append(future)
             for f in as_completed(futures):
                 try:
                     f.result()
                 except Exception:
                     pass
-                finally:
-                    if progress_tracker:
-                        progress_tracker.increment()
         if progress_tracker:
             progress_tracker.end_round()
 
