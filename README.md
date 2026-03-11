@@ -210,8 +210,11 @@ python3 apimspray.py --mode spray \
     --users users.txt \
     --passwords passwords.txt \
     --pace medium \
-    --tenant contoso.com
+    --tenant contoso.com \
+    --remove-disabled
 ```
+
+> `--remove-disabled` drops any account that returns `AADSTS50057` (disabled) from all subsequent password rounds, reducing wasted attempts.
 
 **validate** — 1:1 user:password pair testing (equal-length lists):
 ```bash
@@ -247,6 +250,8 @@ python3 apimspray.py --mode validate \
   --pace {stealth,low,medium,high}
                                Pacing profile (default: low)
   --continue-on-success        Keep spraying after finding valid credentials
+  --remove-disabled            Remove disabled accounts (AADSTS50057) from the
+                               spray list as they are discovered
   --randomize-users            Shuffle user order before each round
   --verbose                    Enable progress output (press Enter to print status)
   --output OUTPUT              Output directory (default: results)
