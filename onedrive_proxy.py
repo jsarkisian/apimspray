@@ -123,22 +123,23 @@ def deploy(tenant, domain, regions, count, outfile):
     except Exception:
         die("Azure CLI not logged in. Run: az login")
 
-    reg_state = run_command(
-        "az provider show --namespace Microsoft.ContainerInstance "
-        "--query registrationState -o tsv", check=False)
-    if reg_state and reg_state.strip() != "Registered":
-        log("info", "Registering Microsoft.ContainerInstance provider...")
-        run_command("az provider register --namespace Microsoft.ContainerInstance")
-        for _ in range(30):
-            time.sleep(5)
-            state = run_command(
-                "az provider show --namespace Microsoft.ContainerInstance "
-                "--query registrationState -o tsv", check=False)
-            if state and state.strip() == "Registered":
-                break
-        else:
-            die("Microsoft.ContainerInstance provider did not register in time.")
-        log("ok", "Provider registered")
+    for ns in ("Microsoft.ContainerInstance", "Microsoft.ContainerRegistry"):
+        reg_state = run_command(
+            f"az provider show --namespace {ns} "
+            f"--query registrationState -o tsv", check=False)
+        if reg_state and reg_state.strip() != "Registered":
+            log("info", f"Registering {ns} provider...")
+            run_command(f"az provider register --namespace {ns}")
+            for _ in range(30):
+                time.sleep(5)
+                state = run_command(
+                    f"az provider show --namespace {ns} "
+                    f"--query registrationState -o tsv", check=False)
+                if state and state.strip() == "Registered":
+                    break
+            else:
+                die(f"{ns} provider did not register in time.")
+            log("ok", f"{ns} provider registered")
 
     log("info", f"Target: {sharepoint_host}")
     log("info", f"Creating Resource Group: {rg_name} in {rg_location}")
