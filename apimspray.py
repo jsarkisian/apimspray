@@ -175,7 +175,10 @@ class Logger:
             print(console_message)
         with self.locks[result_type]:
             with open(self.files[result_type], "a", encoding="utf-8") as f:
-                f.write(f"{utc_now_str()} | {file_message}\n")
+                if result_type == "enumerated":
+                    f.write(f"{file_message}\n")
+                else:
+                    f.write(f"{utc_now_str()} | {file_message}\n")
 
 class ProgressTracker:
     """Thread-safe progress tracker that prints status when the user hits Enter."""
@@ -828,6 +831,18 @@ def main():
             progress_tracker.end_session()
 
     _print_summary(logger, locked_users_set, invalid_users_set, disabled_users_set)
+
+    # Purge not-found and (optionally) disabled users from the users file on disk
+    if args.mode == "spray" and args.users:
+        remove_set = set(invalid_users_set)
+        if args.remove_disabled:
+            remove_set |= disabled_users_set
+        if remove_set:
+            remaining = [u for u in users if u not in remove_set]
+            with open(args.users, "w") as f:
+                f.write("\n".join(remaining) + "\n" if remaining else "")
+            print_info(f"Removed {len(remove_set)} user(s) from {args.users}: "
+                       f"{', '.join(sorted(remove_set))}")
 
 
 def _run_enumerate(args):
