@@ -391,6 +391,88 @@ def load_file_lines(path):
     with open(p, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
+HISTORY_FILE = Path(".apimspray_history.json")
+
+def _load_password_history():
+    """Load per-domain password attempt history from disk."""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def _save_password_history(history):
+    """Save per-domain password attempt history to disk."""
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+def _get_domain_from_users(users):
+    """Extract the domain from the user list (takes the first user's domain)."""
+    for u in users:
+        if "@" in u:
+            return u.split("@", 1)[1].lower()
+    return None
+
+def _check_and_record_passwords(passwords, domain):
+    """Check passwords against history for this domain.
+
+    Returns the list of passwords to actually spray (duplicates removed if
+    the user chooses to skip them).  Records all sprayed passwords in history.
+    """
+    if not domain:
+        return passwords
+
+    history = _load_password_history()
+    past = set(history.get(domain, []))
+
+    duplicates = [p for p in passwords if p in past]
+    if not duplicates:
+        # Record and return all
+        history.setdefault(domain, [])
+        for p in passwords:
+            if p not in past:
+                history[domain].append(p)
+        _save_password_history(history)
+        return passwords
+
+    # Warn the user
+    dup_list = ", ".join(duplicates)
+    print_warn(f"The following password(s) were already attempted against "
+               f"{style(domain, TermColors.CYAN, TermColors.BOLD)}: {style(dup_list, TermColors.YELLOW)}")
+
+    if sys.stdin.isatty():
+        try:
+            choice = input("  [S]kip duplicates / [C]ontinue anyway / [A]bort? [S/c/a]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
+    else:
+        choice = "s"
+
+    if choice in ("a", "abort"):
+        print_error("Aborted by user.")
+        sys.exit(1)
+
+    if choice in ("c", "continue"):
+        spray_passwords = passwords
+    else:
+        # Default: skip duplicates
+        spray_passwords = [p for p in passwords if p not in past]
+        if not spray_passwords:
+            print_warn("All passwords already attempted for this domain. Nothing to spray.")
+            return []
+        print_info(f"Skipping {len(duplicates)} duplicate(s). {len(spray_passwords)} password(s) remaining.")
+
+    # Record newly attempted passwords
+    history.setdefault(domain, [])
+    for p in spray_passwords:
+        if p not in past:
+            history[domain].append(p)
+    _save_password_history(history)
+    return spray_passwords
+
 def normalize_users(users, domain):
     normalized = []
     for u in users:
@@ -614,6 +696,7 @@ def main():
     parser.add_argument("--remove-disabled", action="store_true", help="Remove disabled accounts (AADSTS50057) from the spray list as they are discovered.")
     parser.add_argument("--randomize-users", action="store_true", help="Randomize user order before each round.")
     parser.add_argument("--verbose", action="store_true", help="Enable on-demand progress output (press Enter to see progress).")
+    parser.add_argument("--no-history", action="store_true", help="Skip duplicate password checking (don't warn about previously attempted passwords).")
 
     # Enumerate-specific arguments
     parser.add_argument(
@@ -792,6 +875,11 @@ def main():
         if not users or not passwords:
             print_error("Spray mode requires --users and --passwords")
             sys.exit(1)
+        if not args.no_history:
+            domain = _get_domain_from_users(users)
+            passwords = _check_and_record_passwords(passwords, domain)
+            if not passwords:
+                sys.exit(0)
         if progress_tracker:
             progress_tracker.begin_session(len(users) * len(passwords))
         pass_chunk_size = pace_config["count"]
